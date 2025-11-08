@@ -19,7 +19,6 @@ const Node = struct {
     const log = std.log.scoped(.node);
 
     allocator: std.mem.Allocator,
-    clients: std.AutoHashMap(ID, *Client),
     id: ID,
 
     pub fn runUntilComplete(node: *Node, rt: *zio.Runtime) !void {
@@ -65,8 +64,8 @@ const Node = struct {
             const stream = try server.accept(rt);
             errdefer stream.close(rt);
 
-            log.info("Client connected: {f}", .{stream.socket.address.ip});
-            var task = try rt.spawn(handleClient, .{ self, rt, stream }, .{});
+            log.info("Peer connected: {f}", .{stream.socket.address.ip});
+            var task = try rt.spawn(handlePeer, .{ self, rt, stream }, .{});
             task.detach(rt);
         }
     }
@@ -76,31 +75,42 @@ const Node = struct {
         log.info("Shutting down gracefully...", .{});
     }
 
-    fn handleClient(self: *Self, rt: *zio.Runtime, stream: zio.net.Stream) !void {
+    fn handlePeer(self: *Self, rt: *zio.Runtime, stream: zio.net.Stream) !void {
         errdefer stream.close(rt);
 
-        const clientId = Client.handshake(rt, stream, self.id) catch |err| switch (err) {
+        const peerId = Peer.handshake(rt, stream, self.id) catch |err| switch (err) {
             error.HandshakeFailed => return,
             else => return err,
         };
 
-        var client = Client{ .rt = rt, .stream = stream, .id = clientId };
+        const peer = try Peer.init(self.allocator, rt, stream, peerId);
+        defer peer.close();
 
-        defer client.close();
-        log.debug("Client accepted: {f}", .{client.id});
-
-        try client.run();
+        log.debug("Peer accepted: {f}", .{peer.id});
+        try peer.run();
     }
 };
 
-const Client = struct {
-    const log = std.log.scoped(.client);
+const Peer = struct {
+    const log = std.log.scoped(.peer);
     rt: *zio.Runtime,
     stream: zio.net.Stream,
     id: ID,
     pub const Error = error{HandshakeFailed};
 
-    fn run(self: *Client) !void {
+    pub fn init(allocator: std.mem.Allocator, rt: *zio.Runtime, stream: zio.net.Stream, id: ID) !*Peer {
+        const peer = try allocator.create(Peer);
+
+        peer.* = .{
+            .rt = rt,
+            .id = id,
+            .stream = stream,
+        };
+
+        return peer;
+    }
+
+    fn run(self: *Peer) !void {
         var read_buffer: [1024]u8 = undefined;
         var reader = self.stream.reader(self.rt, &read_buffer);
 
@@ -126,9 +136,9 @@ const Client = struct {
             return Error.HandshakeFailed;
         }
 
-        var client_pubkey: [32]u8 = undefined;
+        var peer_pubkey: [32]u8 = undefined;
         const key = try reader.interface.takeArray(32);
-        @memcpy(&client_pubkey, key);
+        @memcpy(&peer_pubkey, key);
 
         var write_buffer: [1024]u8 = undefined;
         var writer = stream.writer(rt, &write_buffer);
@@ -137,14 +147,14 @@ const Client = struct {
         try writer.interface.flush();
 
         return .{
-            .public_key = client_pubkey,
+            .public_key = peer_pubkey,
             .address = stream.socket.address.ip,
         };
     }
 
-    fn close(self: *Client) void {
+    fn close(self: *Peer) void {
         self.stream.close(self.rt);
-        log.info("Closed client: {f}", .{self.stream.socket.address.ip});
+        log.info("Closed peer: {f}", .{self.stream.socket.address.ip});
     }
 };
 
@@ -159,6 +169,5 @@ pub fn init(allocator: std.mem.Allocator, kp: std.crypto.sign.Ed25519.KeyPair) !
             .public_key = kp.public_key.toBytes(),
             .address = null,
         },
-        .clients = .init(allocator),
     };
 }
