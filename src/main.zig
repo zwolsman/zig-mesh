@@ -1,5 +1,8 @@
 const std = @import("std");
+
 const zio = @import("zio");
+
+const Node = @import("./node.zig");
 
 fn handleClient(rt: *zio.Runtime, stream: zio.net.Stream) !void {
     defer stream.close(rt);
@@ -45,5 +48,7 @@ pub fn main() !void {
     const rt = try zio.Runtime.init(gpa.allocator(), .{});
     defer rt.deinit();
 
-    try rt.runUntilComplete(serverTask, .{rt}, .{});
+    var node = try Node.init(gpa.allocator(), std.crypto.sign.Ed25519.KeyPair.generate());
+
+    try node.runUntilComplete(rt);
 }
