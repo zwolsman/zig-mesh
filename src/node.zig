@@ -62,6 +62,27 @@ pub const Node = struct {
         try rt.run();
     }
 
+    pub fn getOrCreatePeer(node: *Node, rt: *zio.Runtime, address: std.net.Address) !?*Peer {
+        const addr = zio.net.Address.fromStd(address);
+
+        const result = try node.peer_store.address_peer.getOrPut(addr);
+        if (!result.found_existing) {
+            log.debug("Trying to connect to peer: {f}", .{addr});
+
+            // TODO: why doesn't the normal method not work --> const stream = try addr.connect(rt);
+            const stream = try zio.net.tcpConnectToHost(rt, "localhost", addr.ip.getPort());
+            log.debug("Connected to peer: {f}", .{addr});
+
+            const peer_id = try Peer.handshake(rt, stream, node.id, .initiator);
+            const peer = try Peer.init(node.allocator, rt, stream, peer_id);
+
+            log.debug("Handshake complete for peer {f}", .{peer.id});
+            result.value_ptr.* = peer;
+        }
+
+        return result.value_ptr.*;
+    }
+
     fn signalHandler(rt: *zio.Runtime, node: *Node) !void {
         var sig = try zio.Signal.init(.interrupt);
         defer sig.deinit();
@@ -105,7 +126,7 @@ pub const Node = struct {
     fn handlePeer(self: *Self, rt: *zio.Runtime, stream: zio.net.Stream) !void {
         errdefer stream.close(rt);
 
-        const peerId = Peer.handshake(rt, stream, self.id) catch |err| switch (err) {
+        const peerId = Peer.handshake(rt, stream, self.id, .responder) catch |err| switch (err) {
             error.HandshakeFailed => return,
             else => return err,
         };
@@ -161,34 +182,63 @@ const Peer = struct {
         }
     }
 
-    fn handshake(rt: *zio.Runtime, stream: zio.net.Stream, id: ID) !ID {
+    fn handshake(rt: *zio.Runtime, stream: zio.net.Stream, id: ID, role: enum { initiator, responder }) !ID {
         var read_buffer: [1024]u8 = undefined;
         var reader = stream.reader(rt, &read_buffer);
-        const line = try reader.interface.takeDelimiterExclusive('\n');
-        if (!std.mem.eql(u8, line, "hey!")) {
-            log.debug("Handshake failed, disconnecting", .{});
-            return Error.HandshakeFailed;
-        }
-
-        var peer_pubkey: [32]u8 = undefined;
-        const key = try reader.interface.takeArray(32);
-        @memcpy(&peer_pubkey, key);
 
         var write_buffer: [1024]u8 = undefined;
         var writer = stream.writer(rt, &write_buffer);
 
-        try writer.interface.print("hello{f}", .{id});
-        try writer.interface.flush();
+        switch (role) {
+            .initiator => {
+                try writer.interface.print("hey!\n", .{});
+                try writer.interface.flush();
+                const line = try reader.interface.takeDelimiterExclusive('\n');
+                if (!std.mem.eql(u8, line, "hello!")) {
+                    log.debug("Handshake failed, disconnecting", .{});
+                    return Error.HandshakeFailed;
+                }
 
-        return .{
-            .public_key = peer_pubkey,
-            .address = stream.socket.address,
-        };
+                try writer.interface.print("{x}\n", .{id.public_key});
+                try writer.interface.flush();
+
+                var peer_pubkey: [32]u8 = undefined;
+                const key = try reader.interface.takeArray(32);
+                @memcpy(&peer_pubkey, key);
+
+                return .{
+                    .public_key = peer_pubkey,
+                    .address = stream.socket.address,
+                };
+            },
+            .responder => {
+                const line = try reader.interface.takeDelimiterExclusive('\n');
+                if (!std.mem.eql(u8, line, "hey!")) {
+                    log.debug("Handshake failed, disconnecting", .{});
+                    return Error.HandshakeFailed;
+                }
+
+                try writer.interface.print("hello!\n", .{});
+                try writer.interface.flush();
+
+                var peer_pubkey: [32]u8 = undefined;
+                const key = try reader.interface.takeArray(32);
+                @memcpy(&peer_pubkey, key);
+
+                try writer.interface.print("{x}\n", .{id.public_key});
+                try writer.interface.flush();
+
+                return .{
+                    .public_key = peer_pubkey,
+                    .address = stream.socket.address,
+                };
+            },
+        }
     }
 
     fn close(self: *Peer) void {
         self.stream.close(self.rt);
-        log.info("Closed peer: {f}", .{self.stream.socket.address.ip});
+        log.info("Closed peer: {f}", .{self.id});
     }
 };
 

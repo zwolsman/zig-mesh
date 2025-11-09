@@ -6,6 +6,7 @@ const zio = @import("zio");
 const Node = @import("./node.zig").Node;
 
 const Flags = struct {
+    seed: ?u256 = null,
     listen_address: ?[]const u8 = null,
     interactive: bool = false,
     positional: struct {
@@ -80,7 +81,7 @@ pub fn main() !void {
 
     const allocator = gpa.allocator();
 
-    const rt = try zio.Runtime.init(allocator, .{});
+    const rt = try zio.Runtime.init(allocator, .{ .thread_pool = .{ .enabled = true } });
     defer rt.deinit();
 
     const args = try std.process.argsAlloc(allocator);
@@ -92,13 +93,49 @@ pub fn main() !void {
     else
         std.net.Address.parseIp4("127.0.0.1", 0);
 
-    var node = try Node.init(allocator, std.crypto.sign.Ed25519.KeyPair.generate());
+    const kp = if (options.seed) |seed|
+        try std.crypto.sign.Ed25519.KeyPair.generateDeterministic(std.mem.toBytes(seed))
+    else
+        std.crypto.sign.Ed25519.KeyPair.generate();
+
+    const seed = std.mem.bytesToValue(u256, &kp.secret_key.seed());
+    std.log.debug("seed: {d}", .{seed});
+
+    var node = try Node.init(allocator, kp);
     defer node.deinit();
 
     try node.bind(rt, address);
 
     var node_job = try rt.spawn(Node.run, .{ &node, rt }, .{});
-    node_job.detach(rt);
+    defer node_job.cancel(rt);
+
+    var bootstrap_job = try rt.spawn(bootstrapNode, .{ &node, rt, options.positional.trailing }, .{});
+    defer bootstrap_job.cancel(rt);
 
     try rt.run();
+
+    bootstrap_job.join(rt);
+    try node_job.join(rt);
+}
+
+fn bootstrapNode(node: *Node, rt: *zio.Runtime, bootstrap_addresses: []const []const u8) void {
+    if (bootstrap_addresses.len == 0) return;
+
+    for (bootstrap_addresses) |raw_address| {
+        const addr = Flags.parseIpAddress(raw_address) catch |err| {
+            std.log.debug("Could not parse {s}: {}", .{ raw_address, err });
+            continue;
+        };
+
+        const peer = node.getOrCreatePeer(rt, addr) catch |err| {
+            std.log.debug("Could not connect to peer {f}: {}", .{ addr, err });
+            continue;
+        } orelse {
+            std.log.debug("Could not find peer {f}", .{addr});
+            continue;
+        };
+
+        std.log.debug("Connected to bootstrap peer {f}", .{peer.id});
+        // TODO: query bootstrap peer for their peers
+    }
 }
