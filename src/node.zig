@@ -21,6 +21,7 @@ pub const Node = struct {
     allocator: std.mem.Allocator,
     id: ID,
     peer_store: PeerStore,
+    server: ?zio.net.Server,
 
     pub fn init(allocator: std.mem.Allocator, kp: std.crypto.sign.Ed25519.KeyPair) !Node {
         return .{
@@ -30,6 +31,7 @@ pub const Node = struct {
                 .address = null,
             },
             .peer_store = try .init(allocator),
+            .server = null,
         };
     }
 
@@ -37,46 +39,43 @@ pub const Node = struct {
         self.peer_store.deinit();
     }
 
-    pub fn run(node: *Node, rt: *zio.Runtime) !void {
-        var shutdown = std.atomic.Value(bool).init(false);
+    pub fn bind(self: *Node, rt: *zio.Runtime, address: std.net.Address) !void {
+        const addr = zio.net.Address.fromStd(address);
+        const server = try addr.ip.listen(rt, .{ .reuse_address = true });
 
+        // TODO: set external ip, not the local ip :)
+        self.id.address = server.socket.address;
+        self.server = server;
+
+        log.info("Listening on {f}", .{self.id});
+    }
+
+    pub fn run(node: *Node, rt: *zio.Runtime) !void {
         // Spawn server task
-        var server_task = try rt.spawn(Node.serverLoop, .{ node, rt, &shutdown, 0 }, .{});
+        var server_task = try rt.spawn(Node.serverLoop, .{ node, rt }, .{});
         defer server_task.cancel(rt);
 
         // Spawn signal handler task
-        var signal_task = try rt.spawn(signalHandler, .{ rt, &shutdown }, .{});
+        var signal_task = try rt.spawn(signalHandler, .{ rt, node }, .{});
         defer signal_task.cancel(rt);
 
         try rt.run();
     }
 
-    fn signalHandler(rt: *zio.Runtime, shutdown: *std.atomic.Value(bool)) !void {
+    fn signalHandler(rt: *zio.Runtime, node: *Node) !void {
         var sig = try zio.Signal.init(.interrupt);
         defer sig.deinit();
 
         try sig.wait(rt);
 
         std.log.info("Received signal, initiating shutdown...", .{});
-        shutdown.store(true, .release);
+        node.shutdown(rt);
     }
 
-    fn serverLoop(self: *Self, rt: *zio.Runtime, shutdown: *std.atomic.Value(bool), port: u16) !void {
-        const addr = try zio.net.IpAddress.parseIp4("127.0.0.1", port);
-
-        const server = try addr.listen(rt, .{});
-        defer server.close(rt);
-
-        self.id.address = server.socket.address;
-
-        log.info("Listening on {f}", .{self.id});
+    fn serverLoop(self: *Self, rt: *zio.Runtime) !void {
+        const server = self.server orelse return error.NoServer;
 
         while (true) {
-            if (shutdown.load(.acquire)) {
-                try self.close();
-                break;
-            }
-
             const stream = try server.accept(rt);
             errdefer stream.close(rt);
 
@@ -86,9 +85,21 @@ pub const Node = struct {
         }
     }
 
-    fn close(self: *Self) !void {
-        _ = self; // autofix
+    fn shutdown(self: *Self, rt: *zio.Runtime) void {
         log.info("Shutting down gracefully...", .{});
+
+        log.info("Closing peers (n={d})...", .{self.peer_store.address_peer.count()});
+        var it = self.peer_store.address_peer.valueIterator();
+        while (it.next()) |peer| {
+            peer.*.close();
+            self.peer_store.remove(peer.*) catch {};
+        }
+
+        if (self.server) |server| {
+            log.info("Closing server...", .{});
+            server.shutdown(rt, .both) catch {};
+            server.close(rt);
+        }
     }
 
     fn handlePeer(self: *Self, rt: *zio.Runtime, stream: zio.net.Stream) !void {

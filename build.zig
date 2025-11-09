@@ -91,6 +91,13 @@ pub fn build(b: *std.Build) void {
     // the executable from your call to b.addExecutable(...)
     exe.root_module.addImport("zio", zio.module("zio"));
 
+    const flags_dep = b.dependency("flags", .{
+        .target = target,
+        .optimize = optimize,
+    });
+
+    exe.root_module.addImport("flags", flags_dep.module("flags"));
+
     // This declares intent for the executable to be installed into the
     // install prefix when running `zig build` (i.e. when executing the default
     // step). By default the install prefix is `zig-out/` but can be overridden

@@ -36,6 +36,10 @@
             .url = "git+https://github.com/lalinsky/zio#e3f4f30f7b738142cafcee5dd59ac96d4b3654b5",
             .hash = "zio-0.4.0-xHbVVMNIHABZdYPLKr4QO1RCdts3N-uzVV6ZQ4_Dmnpu",
         },
+        .flags = .{
+            .url = "git+https://github.com/joegm/flags#2d62be30ff33661a2a3c6743ac922a78302d78a0",
+            .hash = "flags-0.10.0-a_9h3pxvAAA6wPndlO7ktfrpZUmhQu1y8aDm0lTi5ATR",
+        },
     },
     .paths = .{
         "build.zig",
