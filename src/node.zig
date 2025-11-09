@@ -53,13 +53,11 @@ pub const Node = struct {
     pub fn run(node: *Node, rt: *zio.Runtime) !void {
         // Spawn server task
         var server_task = try rt.spawn(Node.serverLoop, .{ node, rt }, .{});
-        defer server_task.cancel(rt);
+        server_task.detach(rt);
 
         // Spawn signal handler task
-        var signal_task = try rt.spawn(signalHandler, .{ rt, node }, .{});
-        defer signal_task.cancel(rt);
-
-        try rt.run();
+        var signal_task = try rt.spawn(signalHandler, .{ node, rt }, .{});
+        signal_task.detach(rt);
     }
 
     pub fn getOrCreatePeer(node: *Node, rt: *zio.Runtime, address: std.net.Address) !?*Peer {
@@ -83,7 +81,7 @@ pub const Node = struct {
         return result.value_ptr.*;
     }
 
-    fn signalHandler(rt: *zio.Runtime, node: *Node) !void {
+    fn signalHandler(node: *Node, rt: *zio.Runtime) !void {
         var sig = try zio.Signal.init(.interrupt);
         defer sig.deinit();
 

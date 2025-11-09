@@ -145,8 +145,6 @@ fn bootstrapNode(rt: *zio.Runtime, node: *Node, bootstrap_addresses: []const []c
 }
 
 fn tty(rt: *zio.Runtime, node: *Node) !void {
-    _ = rt; // autofix
-
     const log = std.log.scoped(.tty);
     log.debug("waiting for command..", .{});
 
@@ -155,17 +153,20 @@ fn tty(rt: *zio.Runtime, node: *Node) !void {
     var buffer: [1024]u8 = undefined;
     var reader = in.reader(&buffer);
     while (true) {
-        const command_name = try reader.interface.takeDelimiterExclusive('\n');
+        const raw_command = try reader.interface.takeDelimiterExclusive('\n');
+        var tokens = std.mem.tokenizeScalar(u8, raw_command, ' ');
 
         var upper_buf: [32]u8 = undefined;
-        if (command_name.len > upper_buf.len) {
-            log.err("command name too long", .{});
-            continue;
+        if (tokens.peek()) |name| {
+            if (name.len > upper_buf.len) {
+                log.err("command name too long", .{});
+                continue;
+            }
         }
 
-        const upper_cmd = std.ascii.upperString(&upper_buf, command_name);
+        const upper_cmd = std.ascii.upperString(&upper_buf, tokens.next().?);
         if (std.mem.eql(u8, upper_cmd, "HELP")) {
-            std.debug.print("there is no help, figure it out yoruself\n", .{});
+            std.debug.print("There is no help, figure it out yoruself\n", .{});
         } else if (std.mem.eql(u8, upper_cmd, "PEERS")) {
             std.debug.print("{} peer(s) connected\n", .{node.peer_store.address_peer.count()});
             var it = node.peer_store.address_peer.valueIterator();
@@ -174,6 +175,26 @@ fn tty(rt: *zio.Runtime, node: *Node) !void {
             }
         } else if (std.mem.eql(u8, upper_cmd, "ID")) {
             std.debug.print("{f}\n", .{node.id});
+        } else if (std.mem.eql(u8, upper_cmd, "CONNECT")) {
+            const raw_address = tokens.next() orelse {
+                log.err("Address argument missing, format: connect <address>", .{});
+                continue;
+            };
+
+            const addr = Flags.parseIpAddress(raw_address) catch |err| {
+                log.err("Could not parse address {s}: {}", .{ raw_address, err });
+                continue;
+            };
+
+            const peer = node.getOrCreatePeer(rt, addr) catch |err| {
+                log.warn("Could not connect to peer {f}: {}", .{ addr, err });
+                continue;
+            } orelse {
+                log.warn("Could not connect to peer {f}", .{addr});
+                continue;
+            };
+
+            std.debug.print("Connected to peer {f}\n", .{peer.id});
         }
     }
 }
