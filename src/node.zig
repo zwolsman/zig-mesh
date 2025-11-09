@@ -33,7 +33,11 @@ pub const Node = struct {
         };
     }
 
-    pub fn runUntilComplete(node: *Node, rt: *zio.Runtime) !void {
+    pub fn deinit(self: *Node) void {
+        self.peer_store.deinit();
+    }
+
+    pub fn run(node: *Node, rt: *zio.Runtime) !void {
         var shutdown = std.atomic.Value(bool).init(false);
 
         // Spawn server task
@@ -215,6 +219,11 @@ const PeerStore = struct {
             .address_peer = .init(allocator),
             .key_peer = .init(allocator),
         };
+    }
+
+    pub fn deinit(self: *PeerStore) void {
+        self.address_peer.deinit();
+        self.key_peer.deinit();
     }
 
     pub fn register(self: *PeerStore, peer: *Peer) !void {
