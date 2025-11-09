@@ -2,7 +2,7 @@ const std = @import("std");
 
 const zio = @import("zio");
 
-const Node = @import("./node.zig");
+const Node = @import("./node.zig").Node;
 
 fn handleClient(rt: *zio.Runtime, stream: zio.net.Stream) !void {
     defer stream.close(rt);
@@ -45,10 +45,12 @@ pub fn main() !void {
     var gpa = std.heap.GeneralPurposeAllocator(.{}){};
     defer _ = gpa.deinit();
 
-    const rt = try zio.Runtime.init(gpa.allocator(), .{});
+    const allocator = gpa.allocator();
+
+    const rt = try zio.Runtime.init(allocator, .{});
     defer rt.deinit();
 
-    var node = try Node.init(gpa.allocator(), std.crypto.sign.Ed25519.KeyPair.generate());
+    var node = try Node.init(allocator, std.crypto.sign.Ed25519.KeyPair.generate());
 
     try node.runUntilComplete(rt);
 }

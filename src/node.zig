@@ -14,13 +14,24 @@ const ID = struct {
     }
 };
 
-const Node = struct {
+pub const Node = struct {
     const Self = @This();
     const log = std.log.scoped(.node);
 
     allocator: std.mem.Allocator,
     id: ID,
     peer_store: PeerStore,
+
+    pub fn init(allocator: std.mem.Allocator, kp: std.crypto.sign.Ed25519.KeyPair) !Node {
+        return .{
+            .allocator = allocator,
+            .id = .{
+                .public_key = kp.public_key.toBytes(),
+                .address = null,
+            },
+            .peer_store = try .init(allocator),
+        };
+    }
 
     pub fn runUntilComplete(node: *Node, rt: *zio.Runtime) !void {
         var shutdown = std.atomic.Value(bool).init(false);
@@ -229,14 +240,3 @@ const PeerStore = struct {
 const Options = struct {
     kp: std.crypto.sign.Ed25519.KeyPair,
 };
-
-pub fn init(allocator: std.mem.Allocator, kp: std.crypto.sign.Ed25519.KeyPair) !Node {
-    return .{
-        .allocator = allocator,
-        .id = .{
-            .public_key = kp.public_key.toBytes(),
-            .address = null,
-        },
-        .peer_store = try .init(allocator),
-    };
-}
