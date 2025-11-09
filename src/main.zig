@@ -107,18 +107,20 @@ pub fn main() !void {
     try node.bind(rt, address);
 
     var node_job = try rt.spawn(Node.run, .{ &node, rt }, .{});
-    defer node_job.cancel(rt);
+    node_job.detach(rt);
 
-    var bootstrap_job = try rt.spawn(bootstrapNode, .{ &node, rt, options.positional.trailing }, .{});
-    defer bootstrap_job.cancel(rt);
+    var bootstrap_job = try rt.spawn(bootstrapNode, .{ rt, &node, options.positional.trailing }, .{});
+    bootstrap_job.detach(rt);
+
+    if (options.interactive) {
+        var tty_job = try rt.spawnBlocking(tty, .{ rt, &node });
+        tty_job.detach(rt);
+    }
 
     try rt.run();
-
-    bootstrap_job.join(rt);
-    try node_job.join(rt);
 }
 
-fn bootstrapNode(node: *Node, rt: *zio.Runtime, bootstrap_addresses: []const []const u8) void {
+fn bootstrapNode(rt: *zio.Runtime, node: *Node, bootstrap_addresses: []const []const u8) void {
     if (bootstrap_addresses.len == 0) return;
 
     for (bootstrap_addresses) |raw_address| {
@@ -137,5 +139,41 @@ fn bootstrapNode(node: *Node, rt: *zio.Runtime, bootstrap_addresses: []const []c
 
         std.log.debug("Connected to bootstrap peer {f}", .{peer.id});
         // TODO: query bootstrap peer for their peers
+    }
+
+    std.log.debug("Finished bootstrapping", .{});
+}
+
+fn tty(rt: *zio.Runtime, node: *Node) !void {
+    _ = rt; // autofix
+
+    const log = std.log.scoped(.tty);
+    log.debug("waiting for command..", .{});
+
+    const in = std.fs.File.stdin();
+
+    var buffer: [1024]u8 = undefined;
+    var reader = in.reader(&buffer);
+    while (true) {
+        const command_name = try reader.interface.takeDelimiterExclusive('\n');
+
+        var upper_buf: [32]u8 = undefined;
+        if (command_name.len > upper_buf.len) {
+            log.err("command name too long", .{});
+            continue;
+        }
+
+        const upper_cmd = std.ascii.upperString(&upper_buf, command_name);
+        if (std.mem.eql(u8, upper_cmd, "HELP")) {
+            std.debug.print("there is no help, figure it out yoruself\n", .{});
+        } else if (std.mem.eql(u8, upper_cmd, "PEERS")) {
+            std.debug.print("{} peer(s) connected\n", .{node.peer_store.address_peer.count()});
+            var it = node.peer_store.address_peer.valueIterator();
+            while (it.next()) |peer| {
+                std.debug.print("  {f}\n", .{peer.*.id});
+            }
+        } else if (std.mem.eql(u8, upper_cmd, "ID")) {
+            std.debug.print("{f}\n", .{node.id});
+        }
     }
 }
