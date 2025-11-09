@@ -4,7 +4,7 @@ const zio = @import("zio");
 
 const ID = struct {
     public_key: [32]u8,
-    address: ?zio.net.IpAddress,
+    address: ?zio.net.Address,
     pub fn format(self: ID, writer: *std.Io.Writer) std.Io.Writer.Error!void {
         if (self.address) |addr| {
             try std.Io.Writer.print(writer, "{f}[{x}]", .{ addr, &self.public_key });
@@ -20,6 +20,7 @@ const Node = struct {
 
     allocator: std.mem.Allocator,
     id: ID,
+    peer_store: PeerStore,
 
     pub fn runUntilComplete(node: *Node, rt: *zio.Runtime) !void {
         var shutdown = std.atomic.Value(bool).init(false);
@@ -51,7 +52,7 @@ const Node = struct {
         const server = try addr.listen(rt, .{});
         defer server.close(rt);
 
-        self.id.address = server.socket.address.ip;
+        self.id.address = server.socket.address;
 
         log.info("Listening on {f}", .{self.id});
 
@@ -64,7 +65,7 @@ const Node = struct {
             const stream = try server.accept(rt);
             errdefer stream.close(rt);
 
-            log.info("Peer connected: {f}", .{stream.socket.address.ip});
+            log.info("Peer connected: {f}", .{stream.socket.address});
             var task = try rt.spawn(handlePeer, .{ self, rt, stream }, .{});
             task.detach(rt);
         }
@@ -84,9 +85,16 @@ const Node = struct {
         };
 
         const peer = try Peer.init(self.allocator, rt, stream, peerId);
-        defer peer.close();
+        defer {
+            peer.close();
+            self.allocator.destroy(peer);
+        }
 
         log.debug("Peer accepted: {f}", .{peer.id});
+
+        try self.peer_store.register(peer);
+        defer self.peer_store.remove(peer) catch {};
+
         try peer.run();
     }
 };
@@ -148,13 +156,73 @@ const Peer = struct {
 
         return .{
             .public_key = peer_pubkey,
-            .address = stream.socket.address.ip,
+            .address = stream.socket.address,
         };
     }
 
     fn close(self: *Peer) void {
         self.stream.close(self.rt);
         log.info("Closed peer: {f}", .{self.stream.socket.address.ip});
+    }
+};
+
+const PeerStore = struct {
+    const log = std.log.scoped(.peer_store);
+    address_peer: std.HashMap(zio.net.Address, *Peer, Context, std.hash_map.default_max_load_percentage),
+    key_peer: std.AutoHashMap([32]u8, *Peer),
+
+    const Context = struct {
+        pub fn hash(_: @This(), address: zio.net.Address) u64 {
+            var hasher = std.hash.Wyhash.init(0);
+
+            switch (address.any.family) {
+                std.posix.AF.INET => {
+                    hasher.update(std.mem.asBytes(&address.ip.in.addr));
+                    hasher.update(std.mem.asBytes(&address.ip.in.port));
+                },
+                std.posix.AF.INET6 => {
+                    hasher.update(std.mem.asBytes(&address.ip.in6.addr));
+                    hasher.update(std.mem.asBytes(&address.ip.in6.flowinfo));
+                    hasher.update(std.mem.asBytes(&address.ip.in6.scope_id));
+                    hasher.update(std.mem.asBytes(&address.ip.in6.port));
+                },
+                else => unreachable,
+            }
+            return hasher.final();
+        }
+
+        pub fn eql(_: @This(), a: zio.net.Address, b: zio.net.Address) bool {
+            if (a.any.family != b.any.family)
+                return false;
+
+            return a.toStd().eql(b.toStd());
+        }
+    };
+
+    pub fn init(allocator: std.mem.Allocator) !PeerStore {
+        return .{
+            .address_peer = .init(allocator),
+            .key_peer = .init(allocator),
+        };
+    }
+
+    pub fn register(self: *PeerStore, peer: *Peer) !void {
+        if (peer.id.address) |addr| {
+            try self.address_peer.putNoClobber(addr, peer);
+        }
+
+        try self.key_peer.putNoClobber(peer.id.public_key, peer);
+
+        log.debug("Registered peer {f}", .{peer.id});
+    }
+
+    pub fn remove(self: *PeerStore, peer: *Peer) !void {
+        if (peer.id.address) |addr| {
+            _ = self.address_peer.remove(addr);
+        }
+        _ = self.key_peer.remove(peer.id.public_key);
+
+        log.debug("Removed peer {f}", .{peer.id});
     }
 };
 
@@ -169,5 +237,6 @@ pub fn init(allocator: std.mem.Allocator, kp: std.crypto.sign.Ed25519.KeyPair) !
             .public_key = kp.public_key.toBytes(),
             .address = null,
         },
+        .peer_store = try .init(allocator),
     };
 }
