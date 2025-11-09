@@ -63,22 +63,25 @@ pub const Node = struct {
     pub fn getOrCreatePeer(node: *Node, rt: *zio.Runtime, address: std.net.Address) !?*Peer {
         const addr = zio.net.Address.fromStd(address);
 
-        const result = try node.peer_store.address_peer.getOrPut(addr);
-        if (!result.found_existing) {
+        if (node.peer_store.address_peer.get(addr)) |peer| {
+            log.debug("Already connected to peer {f}: {f}", .{ addr, peer.id });
+            return peer;
+        } else {
             log.debug("Trying to connect to peer: {f}", .{addr});
 
             // TODO: why doesn't the normal method not work --> const stream = try addr.connect(rt);
             const stream = try zio.net.tcpConnectToHost(rt, "localhost", addr.ip.getPort());
             log.debug("Connected to peer: {f}", .{addr});
 
-            const peer_id = try Peer.handshake(rt, stream, node.id, .initiator);
-            const peer = try Peer.init(node.allocator, rt, stream, peer_id);
-
+            const peer = try node.acceptPeer(rt, stream, .initiator);
             log.debug("Handshake complete for peer {f}", .{peer.id});
-            result.value_ptr.* = peer;
-        }
 
-        return result.value_ptr.*;
+            // TODO: do I want to start the peer job here..? Should not really be this concern..
+            var peer_job = try rt.spawn(Peer.run, .{peer}, .{});
+            peer_job.detach(rt);
+
+            return peer;
+        }
     }
 
     fn signalHandler(node: *Node, rt: *zio.Runtime) !void {
@@ -99,7 +102,12 @@ pub const Node = struct {
             errdefer stream.close(rt);
 
             log.info("Peer connected: {f}", .{stream.socket.address});
-            var task = try rt.spawn(handlePeer, .{ self, rt, stream }, .{});
+            const peer = self.acceptPeer(rt, stream, .responder) catch |err| {
+                log.warn("Could not accept peer: {}", .{err});
+                continue;
+            };
+
+            var task = try rt.spawn(Peer.run, .{peer}, .{});
             task.detach(rt);
         }
     }
@@ -121,29 +129,23 @@ pub const Node = struct {
         }
     }
 
-    fn handlePeer(self: *Self, rt: *zio.Runtime, stream: zio.net.Stream) !void {
-        errdefer stream.close(rt);
-
-        const peerId = Peer.handshake(rt, stream, self.id, .responder) catch |err| switch (err) {
-            error.HandshakeFailed => return,
-            else => return err,
-        };
+    fn acceptPeer(self: *Self, rt: *zio.Runtime, stream: zio.net.Stream, role: HandshakeRole) !*Peer {
+        const peerId = try Peer.handshake(rt, stream, self.id, role);
 
         const peer = try Peer.init(self.allocator, rt, stream, peerId);
-        defer {
+        log.debug("Peer handshake: {f} (ok)", .{peer.id});
+
+        self.peer_store.register(peer) catch |err| {
+            log.warn("Could not register peer {f}: {} -- diconnecting", .{ peer.id, err });
             peer.close();
-            self.allocator.destroy(peer);
-        }
+            return err;
+        };
 
-        log.debug("Peer accepted: {f}", .{peer.id});
-
-        try self.peer_store.register(peer);
-        defer self.peer_store.remove(peer) catch {};
-
-        try peer.run();
+        return peer;
     }
 };
 
+const HandshakeRole = enum { initiator, responder };
 const Peer = struct {
     const log = std.log.scoped(.peer);
     rt: *zio.Runtime,
@@ -164,6 +166,8 @@ const Peer = struct {
     }
 
     fn run(self: *Peer) !void {
+        log.debug("Starting echo service for {f}", .{self.id});
+
         var read_buffer: [1024]u8 = undefined;
         var reader = self.stream.reader(self.rt, &read_buffer);
 
@@ -180,7 +184,7 @@ const Peer = struct {
         }
     }
 
-    fn handshake(rt: *zio.Runtime, stream: zio.net.Stream, id: ID, role: enum { initiator, responder }) !ID {
+    fn handshake(rt: *zio.Runtime, stream: zio.net.Stream, id: ID, role: HandshakeRole) !ID {
         var read_buffer: [1024]u8 = undefined;
         var reader = stream.reader(rt, &read_buffer);
 
@@ -287,9 +291,11 @@ const PeerStore = struct {
 
     pub fn register(self: *PeerStore, peer: *Peer) !void {
         if (peer.id.address) |addr| {
+            log.debug("registering address: {f}", .{addr});
             try self.address_peer.putNoClobber(addr, peer);
         }
 
+        log.debug("registering key: {x}", .{&peer.id.public_key});
         try self.key_peer.putNoClobber(peer.id.public_key, peer);
 
         log.debug("Registered peer {f}", .{peer.id});

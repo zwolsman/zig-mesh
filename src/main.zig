@@ -176,11 +176,7 @@ fn tty(rt: *zio.Runtime, node: *Node) !void {
         } else if (std.mem.eql(u8, upper_cmd, "ID")) {
             std.debug.print("{f}\n", .{node.id});
         } else if (std.mem.eql(u8, upper_cmd, "CONNECT")) {
-            const raw_address = tokens.next() orelse {
-                log.err("Address argument missing, format: connect <address>", .{});
-                continue;
-            };
-
+            const raw_address = tokens.rest();
             const addr = Flags.parseIpAddress(raw_address) catch |err| {
                 log.err("Could not parse address {s}: {}", .{ raw_address, err });
                 continue;
