@@ -44,10 +44,10 @@ pub const Node = struct {
         const server = try addr.ip.listen(rt, .{ .reuse_address = true });
 
         // TODO: set external ip, not the local ip :)
-        self.id.address = server.socket.address;
+        // self.id.address = server.socket.address;
         self.server = server;
 
-        log.info("Listening on {f}", .{self.id});
+        log.info("Listening on {f}{f}", .{ server.socket.address, self.id });
     }
 
     pub fn run(node: *Node, rt: *zio.Runtime) !void {
@@ -166,21 +166,17 @@ const Peer = struct {
     }
 
     fn run(self: *Peer) !void {
-        log.debug("Starting echo service for {f}", .{self.id});
+        log.debug("Listening {f}", .{self.id});
 
         var read_buffer: [1024]u8 = undefined;
         var reader = self.stream.reader(self.rt, &read_buffer);
 
-        var write_buffer: [1024]u8 = undefined;
-        var writer = self.stream.writer(self.rt, &write_buffer);
-
         while (true) {
-            const line = reader.interface.takeDelimiterInclusive('\n') catch |err| switch (err) {
+            const line = reader.interface.takeDelimiterExclusive('\n') catch |err| switch (err) {
                 error.EndOfStream => break,
                 else => return err,
             };
-            try writer.interface.writeAll(line);
-            try writer.interface.flush();
+            log.debug("Received: {s} ({any})", .{ line, line });
         }
     }
 
@@ -195,21 +191,20 @@ const Peer = struct {
             .initiator => {
                 try writer.interface.print("hey!\n", .{});
                 try writer.interface.flush();
+
                 const line = try reader.interface.takeDelimiterExclusive('\n');
                 if (!std.mem.eql(u8, line, "hello!")) {
                     log.debug("Handshake failed, disconnecting", .{});
                     return Error.HandshakeFailed;
                 }
 
-                try writer.interface.print("{x}\n", .{id.public_key});
+                try writer.interface.writeAll(&id.public_key);
                 try writer.interface.flush();
 
-                var peer_pubkey: [32]u8 = undefined;
-                const key = try reader.interface.takeArray(32);
-                @memcpy(&peer_pubkey, key);
+                const peer_pubkey = try reader.interface.takeArray(32);
 
                 return .{
-                    .public_key = peer_pubkey,
+                    .public_key = peer_pubkey.*,
                     .address = stream.socket.address,
                 };
             },
@@ -223,15 +218,13 @@ const Peer = struct {
                 try writer.interface.print("hello!\n", .{});
                 try writer.interface.flush();
 
-                var peer_pubkey: [32]u8 = undefined;
-                const key = try reader.interface.takeArray(32);
-                @memcpy(&peer_pubkey, key);
+                const peer_pubkey = try reader.interface.takeArray(32);
 
-                try writer.interface.print("{x}\n", .{id.public_key});
+                try writer.interface.writeAll(&id.public_key);
                 try writer.interface.flush();
 
                 return .{
-                    .public_key = peer_pubkey,
+                    .public_key = peer_pubkey.*,
                     .address = stream.socket.address,
                 };
             },
@@ -291,11 +284,11 @@ const PeerStore = struct {
 
     pub fn register(self: *PeerStore, peer: *Peer) !void {
         if (peer.id.address) |addr| {
-            log.debug("registering address: {f}", .{addr});
+            log.debug("Registering address: {f}", .{addr});
             try self.address_peer.putNoClobber(addr, peer);
         }
 
-        log.debug("registering key: {x}", .{&peer.id.public_key});
+        log.debug("Registering key: {x}", .{&peer.id.public_key});
         try self.key_peer.putNoClobber(peer.id.public_key, peer);
 
         log.debug("Registered peer {f}", .{peer.id});

@@ -146,7 +146,7 @@ fn bootstrapNode(rt: *zio.Runtime, node: *Node, bootstrap_addresses: []const []c
 
 fn tty(rt: *zio.Runtime, node: *Node) !void {
     const log = std.log.scoped(.tty);
-    log.debug("waiting for command..", .{});
+    log.debug("Waiting for command..", .{});
     var in = zio.Pipe.init(std.fs.File.stdin());
 
     var buffer: [1024]u8 = undefined;
@@ -192,6 +192,32 @@ fn tty(rt: *zio.Runtime, node: *Node) !void {
             };
 
             std.debug.print("Connected to peer {f}\n", .{peer.id});
+        } else if (std.mem.eql(u8, upper_cmd, "PING")) {
+            const raw_dest_id = tokens.next() orelse {
+                log.warn("No destination id provided; ping <dest id>", .{});
+                continue;
+            };
+
+            if (raw_dest_id.len != 64) {
+                log.warn("Destination id not 64 chars", .{});
+                continue;
+            }
+
+            var dest_id: [32]u8 = undefined;
+            _ = try std.fmt.hexToBytes(&dest_id, raw_dest_id);
+
+            const peer = node.peer_store.key_peer.get(dest_id) orelse {
+                log.warn("Not connected to {x}", .{dest_id});
+                continue;
+            };
+
+            log.debug("Found peer: {f}.. writing", .{peer.id});
+
+            var writer = peer.stream.writer(rt, &buffer);
+            try writer.interface.writeAll("ping\n");
+            try writer.interface.flush();
+
+            log.debug("Ping sent!", .{});
         } else {
             std.debug.print("Unknown command: {s}\n", .{upper_cmd});
         }
