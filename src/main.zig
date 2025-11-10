@@ -113,7 +113,7 @@ pub fn main() !void {
     bootstrap_job.detach(rt);
 
     if (options.interactive) {
-        var tty_job = try rt.spawnBlocking(tty, .{ rt, &node });
+        var tty_job = try rt.spawn(tty, .{ rt, &node }, .{});
         tty_job.detach(rt);
     }
 
@@ -147,11 +147,10 @@ fn bootstrapNode(rt: *zio.Runtime, node: *Node, bootstrap_addresses: []const []c
 fn tty(rt: *zio.Runtime, node: *Node) !void {
     const log = std.log.scoped(.tty);
     log.debug("waiting for command..", .{});
-
-    const in = std.fs.File.stdin();
+    var in = zio.Pipe.init(std.fs.File.stdin());
 
     var buffer: [1024]u8 = undefined;
-    var reader = in.reader(&buffer);
+    var reader = in.reader(rt, &buffer);
     while (true) {
         const raw_command = try reader.interface.takeDelimiterExclusive('\n');
         var tokens = std.mem.tokenizeScalar(u8, raw_command, ' ');
@@ -162,6 +161,8 @@ fn tty(rt: *zio.Runtime, node: *Node) !void {
                 log.err("command name too long", .{});
                 continue;
             }
+        } else {
+            continue;
         }
 
         const upper_cmd = std.ascii.upperString(&upper_buf, tokens.next().?);
@@ -191,6 +192,8 @@ fn tty(rt: *zio.Runtime, node: *Node) !void {
             };
 
             std.debug.print("Connected to peer {f}\n", .{peer.id});
+        } else {
+            std.debug.print("Unknown command: {s}\n", .{upper_cmd});
         }
     }
 }
