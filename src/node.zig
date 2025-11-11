@@ -71,14 +71,9 @@ pub const Node = struct {
 
             // TODO: why doesn't the normal method not work --> const stream = try addr.connect(rt);
             const stream = try zio.net.tcpConnectToHost(rt, "localhost", addr.ip.getPort());
-            log.debug("Connected to peer: {f}", .{addr});
 
             const peer = try node.acceptPeer(rt, stream, .initiator);
-            log.debug("Handshake complete for peer {f}", .{peer.id});
-
-            // TODO: do I want to start the peer job here..? Should not really be this concern..
-            var peer_job = try rt.spawn(Peer.run, .{peer}, .{});
-            peer_job.detach(rt);
+            log.debug("Connected to peer: {f}", .{addr});
 
             return peer;
         }
@@ -102,13 +97,10 @@ pub const Node = struct {
             errdefer stream.close(rt);
 
             log.info("Peer connected: {f}", .{stream.socket.address});
-            const peer = self.acceptPeer(rt, stream, .responder) catch |err| {
+            _ = self.acceptPeer(rt, stream, .responder) catch |err| {
                 log.warn("Could not accept peer: {}", .{err});
                 continue;
             };
-
-            var task = try rt.spawn(Peer.run, .{peer}, .{});
-            task.detach(rt);
         }
     }
 
@@ -135,13 +127,25 @@ pub const Node = struct {
         const peer = try Peer.init(self.allocator, rt, stream, peerId);
         log.debug("Peer handshake: {f} (ok)", .{peer.id});
 
+        var peer_job = try rt.spawn(peerLoop, .{ self, peer }, .{});
+        peer_job.detach(rt);
+
+        return peer;
+    }
+
+    fn peerLoop(self: *Self, peer: *Peer) !void {
         self.peer_store.register(peer) catch |err| {
             log.warn("Could not register peer {f}: {} -- diconnecting", .{ peer.id, err });
             peer.close();
             return err;
         };
 
-        return peer;
+        defer peer.close();
+        defer self.peer_store.remove(peer) catch unreachable;
+
+        peer.run() catch |err| {
+            log.debug("Failed to run peer: {}", .{err});
+        };
     }
 };
 
