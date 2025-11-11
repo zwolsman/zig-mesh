@@ -2,6 +2,8 @@ const std = @import("std");
 
 const zio = @import("zio");
 
+const Packet = @import("./packet.zig");
+
 const ID = struct {
     public_key: [32]u8,
     address: ?zio.net.Address,
@@ -127,13 +129,13 @@ pub const Node = struct {
         const peer = try Peer.init(self.allocator, rt, stream, peerId);
         log.debug("Peer handshake: {f} (ok)", .{peer.id});
 
-        var peer_job = try rt.spawn(peerLoop, .{ self, peer }, .{});
+        var peer_job = try rt.spawn(peerLoop, .{ self, rt, peer }, .{});
         peer_job.detach(rt);
 
         return peer;
     }
 
-    fn peerLoop(self: *Self, peer: *Peer) !void {
+    fn peerLoop(self: *Self, rt: *zio.Runtime, peer: *Peer) !void {
         self.peer_store.register(peer) catch |err| {
             log.warn("Could not register peer {f}: {} -- diconnecting", .{ peer.id, err });
             peer.close();
@@ -146,30 +148,39 @@ pub const Node = struct {
         var tcp_read_buffer: [1024]u8 = undefined;
         var tcp_write_buffer: [1024]u8 = undefined;
 
-        var tcp_reader = self.stream.reader(self.rt, &tcp_read_buffer);
-        var tcp_writer = self.stream.writer(self.rt, &tcp_write_buffer);
+        var tcp_reader = peer.stream.reader(rt, &tcp_read_buffer);
+        var tcp_writer = peer.stream.writer(rt, &tcp_write_buffer);
 
         var read_buffer: [1024]u8 = undefined;
         var write_buffer: [1024]u8 = undefined;
         var connection_client = ConnectionClient.init(&tcp_reader.interface, &tcp_writer.interface, &read_buffer, &write_buffer);
 
         while (true) {
-            const packet = readPacket(self.allocator, &connection_client.reader) catch |err| switch (err) {
+            const op, const tag, const payload = Packet.readPacket(&connection_client.reader) catch |err| switch (err) {
                 error.EndOfStream => break,
                 else => return err,
             };
-            defer self.allocator.free(packet);
+            log.debug("Received packet {}({}) {any}", .{ op, tag, payload });
+            var payload_reader = std.Io.Reader.fixed(payload);
 
-            log.debug("raw tcp read buf: {any}", .{tcp_read_buffer});
-            log.debug("tcp read buf: {any}", .{tcp_reader.interface.buffered()});
+            self.handleServerPacket(peer, op, tag, &payload_reader) catch |err| {
+                log.warn("Could not handle packet {}({}): {}", .{ op, tag, err });
+                continue;
+            };
 
-            log.debug("raw conn read buf: {any}", .{read_buffer});
-            log.debug("conn read buf: {any}", .{connection_client.reader.buffered()});
-
-            log.debug("Received: {s} ({any})", .{ packet, packet });
+            std.debug.assert(payload_reader.bufferedLen() == 0); // Should always consume full payload
         }
 
         log.debug("Stopped listening {f}", .{self.id});
+    }
+
+    fn handleServerPacket(node: *Node, peer: *Peer, op: Packet.Op, tag: Packet.Tag, payload: *std.Io.Reader) !void {
+        // TODO: handle server packet!
+        _ = node; // autofix
+        _ = peer; // autofix
+        _ = op; // autofix
+        _ = tag; // autofix
+        _ = payload; // autofix
     }
 };
 
@@ -321,15 +332,6 @@ const PeerStore = struct {
     }
 };
 
-fn readPacket(allocator: std.mem.Allocator, reader: *std.Io.Reader) ![]u8 {
-    std.log.debug("Trying to read packet..", .{});
-    const len = try reader.takeInt(u32, .big);
-    const data = try reader.readAlloc(allocator, len);
-    std.log.debug("Read packet: {any}", .{data});
-
-    return data;
-}
-
 pub const ConnectionClient = struct {
     const log = std.log.scoped(.connection_client);
     /// The buffer is asserted to have capacity at least `min_buffer_len`.
@@ -390,8 +392,9 @@ pub const ConnectionClient = struct {
 
         log.debug("input buf: {any}", .{input.buffered()});
 
-        const packet_size = input.peekInt(u32, .big) catch |err| return err;
-        const packet_end = packet_size + 4;
+        const packet_header = try input.peek(Packet.HEADER_LEN);
+        const packet_size = std.mem.readInt(u16, packet_header[1..3], .big);
+        const packet_end = packet_size + Packet.HEADER_LEN;
 
         log.debug("Received packet of size {d}", .{packet_size});
         if (packet_end > input.bufferedLen()) {
@@ -410,13 +413,11 @@ pub const ConnectionClient = struct {
 
         // Should be packet size but it's not wrapped yet
         r.end += packet_end;
-
         return packet_end;
     }
 
     fn rebase(r: *std.Io.Reader, capacity: usize) void {
         if (r.buffer.len - r.end >= capacity) return;
-        log.debug("rebasing..", .{});
         const data = r.buffer[r.seek..r.end];
         @memmove(r.buffer[0..data.len], data);
         r.seek = 0;

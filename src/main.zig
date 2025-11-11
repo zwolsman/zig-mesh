@@ -4,6 +4,7 @@ const flags = @import("flags");
 const zio = @import("zio");
 
 const Node = @import("./node.zig").Node;
+const Packet = @import("./packet.zig");
 
 const Flags = struct {
     seed: ?u256 = null,
@@ -192,6 +193,48 @@ fn tty(rt: *zio.Runtime, node: *Node) !void {
             };
 
             std.debug.print("Connected to peer {f}\n", .{peer.id});
+        } else if (std.mem.eql(u8, upper_cmd, "ECHO")) {
+            // const raw_dest_id = tokens.next() orelse {
+            //     log.warn("No destination id provided; ping <dest id>", .{});
+            //     continue;
+            // };
+
+            // if (raw_dest_id.len != 64) {
+            //     log.warn("Destination id not 64 chars", .{});
+            //     continue;
+            // }
+
+            // var dest_id: [32]u8 = undefined;
+            // _ = try std.fmt.hexToBytes(&dest_id, raw_dest_id);
+
+            // const peer = node.peer_store.key_peer.get(dest_id) orelse {
+            //     log.warn("Not connected to {x}", .{dest_id});
+            //     continue;
+            // };
+
+            // log.debug("Found peer: {f}.. writing", .{peer.id});
+
+            // var tcp_read_buffer: [1024]u8 = undefined;
+            // var tcp_write_buffer: [1024]u8 = undefined;
+            // var read_buffer: [1024]u8 = undefined;
+            // var write_buffer: [1024]u8 = undefined;
+
+            // var tcp_writer = peer.stream.writer(rt, &tcp_write_buffer);
+            // var tcp_reader = peer.stream.reader(rt, &tcp_read_buffer);
+
+            // var connection_client = @import("./node.zig").ConnectionClient.init(&tcp_reader.interface, &tcp_writer.interface, &read_buffer, &write_buffer);
+
+            // const payload = Packet.Echo{ .msg = tokens.rest() };
+            // try Packet.writePacket(&connection_client.writer, .command, .echo, payload);
+
+            // log.debug("connection buffer: {any}", .{connection_client.writer.buffered()});
+            // log.debug("tcp buffer: {any}", .{tcp_writer.interface.buffered()});
+            // try connection_client.writer.flush();
+            // log.debug("Flushed connection", .{});
+            // log.debug("tcp buffer: {any}", .{tcp_writer.interface.buffered()});
+            // try tcp_writer.interface.flush();
+
+            // log.debug("Ping sent!", .{});
         } else if (std.mem.eql(u8, upper_cmd, "PING")) {
             const raw_dest_id = tokens.next() orelse {
                 log.warn("No destination id provided; ping <dest id>", .{});
@@ -223,8 +266,7 @@ fn tty(rt: *zio.Runtime, node: *Node) !void {
 
             var connection_client = @import("./node.zig").ConnectionClient.init(&tcp_reader.interface, &tcp_writer.interface, &read_buffer, &write_buffer);
 
-            try connection_client.writer.writeInt(u32, 4, .big);
-            try connection_client.writer.writeAll("ping");
+            try Packet.writePacket(&connection_client.writer, .command, .ping, null);
 
             log.debug("connection buffer: {any}", .{connection_client.writer.buffered()});
             log.debug("tcp buffer: {any}", .{tcp_writer.interface.buffered()});
