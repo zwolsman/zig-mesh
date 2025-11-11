@@ -213,9 +213,25 @@ fn tty(rt: *zio.Runtime, node: *Node) !void {
 
             log.debug("Found peer: {f}.. writing", .{peer.id});
 
-            var writer = peer.stream.writer(rt, &buffer);
-            try writer.interface.writeAll("ping\n");
-            try writer.interface.flush();
+            var tcp_read_buffer: [1024]u8 = undefined;
+            var tcp_write_buffer: [1024]u8 = undefined;
+            var read_buffer: [1024]u8 = undefined;
+            var write_buffer: [1024]u8 = undefined;
+
+            var tcp_writer = peer.stream.writer(rt, &tcp_write_buffer);
+            var tcp_reader = peer.stream.reader(rt, &tcp_read_buffer);
+
+            var connection_client = @import("./node.zig").ConnectionClient.init(&tcp_reader.interface, &tcp_writer.interface, &read_buffer, &write_buffer);
+
+            try connection_client.writer.writeInt(u32, 4, .big);
+            try connection_client.writer.writeAll("ping");
+
+            log.debug("connection buffer: {any}", .{connection_client.writer.buffered()});
+            log.debug("tcp buffer: {any}", .{tcp_writer.interface.buffered()});
+            try connection_client.writer.flush();
+            log.debug("Flushed connection", .{});
+            log.debug("tcp buffer: {any}", .{tcp_writer.interface.buffered()});
+            try tcp_writer.interface.flush();
 
             log.debug("Ping sent!", .{});
         } else {

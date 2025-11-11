@@ -148,9 +148,12 @@ pub const Node = struct {
 const HandshakeRole = enum { initiator, responder };
 const Peer = struct {
     const log = std.log.scoped(.peer);
+
     rt: *zio.Runtime,
     stream: zio.net.Stream,
     id: ID,
+    allocator: std.mem.Allocator,
+
     pub const Error = error{HandshakeFailed};
 
     pub fn init(allocator: std.mem.Allocator, rt: *zio.Runtime, stream: zio.net.Stream, id: ID) !*Peer {
@@ -160,24 +163,43 @@ const Peer = struct {
             .rt = rt,
             .id = id,
             .stream = stream,
+            .allocator = allocator,
         };
 
         return peer;
     }
 
+    const buf_size = 20;
     fn run(self: *Peer) !void {
         log.debug("Listening {f}", .{self.id});
 
-        var read_buffer: [1024]u8 = undefined;
-        var reader = self.stream.reader(self.rt, &read_buffer);
+        var tcp_read_buffer: [buf_size]u8 = undefined;
+        var tcp_write_buffer: [buf_size]u8 = undefined;
+
+        var tcp_reader = self.stream.reader(self.rt, &tcp_read_buffer);
+        var tcp_writer = self.stream.writer(self.rt, &tcp_write_buffer);
+
+        var read_buffer: [buf_size]u8 = undefined;
+        var write_buffer: [buf_size]u8 = undefined;
+        var connection_client = ConnectionClient.init(&tcp_reader.interface, &tcp_writer.interface, &read_buffer, &write_buffer);
 
         while (true) {
-            const line = reader.interface.takeDelimiterExclusive('\n') catch |err| switch (err) {
+            const packet = readPacket(self.allocator, &connection_client.reader) catch |err| switch (err) {
                 error.EndOfStream => break,
                 else => return err,
             };
-            log.debug("Received: {s} ({any})", .{ line, line });
+            defer self.allocator.free(packet);
+
+            log.debug("raw tcp read buf: {any}", .{tcp_read_buffer});
+            log.debug("tcp read buf: {any}", .{tcp_reader.interface.buffered()});
+
+            log.debug("raw conn read buf: {any}", .{read_buffer});
+            log.debug("conn read buf: {any}", .{connection_client.reader.buffered()});
+
+            log.debug("Received: {s} ({any})", .{ packet, packet });
         }
+
+        log.debug("Stopped listening {f}", .{self.id});
     }
 
     fn handshake(rt: *zio.Runtime, stream: zio.net.Stream, id: ID, role: HandshakeRole) !ID {
@@ -304,6 +326,151 @@ const PeerStore = struct {
     }
 };
 
-const Options = struct {
-    kp: std.crypto.sign.Ed25519.KeyPair,
+fn readPacket(allocator: std.mem.Allocator, reader: *std.Io.Reader) ![]u8 {
+    std.log.debug("Trying to read packet..", .{});
+    const len = try reader.takeInt(u32, .big);
+    const data = try reader.readAlloc(allocator, len);
+    std.log.debug("Read packet: {any}", .{data});
+
+    return data;
+}
+
+pub const ConnectionClient = struct {
+    const log = std.log.scoped(.connection_client);
+    /// The buffer is asserted to have capacity at least `min_buffer_len`.
+    input: *std.Io.Reader,
+    /// Decrypted stream from the server to the client.
+    reader: std.Io.Reader,
+
+    /// The encrypted stream from the client to the server. Bytes are pushed here
+    /// via `writer`.
+    ///
+    /// The buffer is asserted to have capacity at least `min_buffer_len`.
+    output: *std.Io.Writer,
+    /// The plaintext stream from the client to the server.
+    writer: std.Io.Writer,
+
+    pub fn init(input: *std.Io.Reader, output: *std.Io.Writer, read_buffer: []u8, write_buffer: []u8) ConnectionClient {
+        return .{
+            .input = input,
+            .output = output,
+            .reader = .{
+                .buffer = read_buffer,
+                .vtable = &.{
+                    .stream = stream,
+                    .readVec = readVec,
+                },
+                .seek = 0,
+                .end = 0,
+            },
+            .writer = .{
+                .buffer = write_buffer,
+                .vtable = &.{
+                    .drain = drain,
+                    .flush = flush,
+                },
+            },
+        };
+    }
+
+    fn stream(r: *std.Io.Reader, w: *std.Io.Writer, limit: std.Io.Limit) std.Io.Reader.StreamError!usize {
+        // This function writes exclusively to the buffer.
+        _ = w;
+        _ = limit;
+        const c: *ConnectionClient = @alignCast(@fieldParentPtr("reader", r));
+        return readIndirect(c);
+    }
+
+    fn readVec(r: *std.Io.Reader, data: [][]u8) std.Io.Reader.Error!usize {
+        // This function writes exclusively to the buffer.
+        _ = data;
+        const c: *ConnectionClient = @alignCast(@fieldParentPtr("reader", r));
+        return readIndirect(c);
+    }
+
+    fn readIndirect(c: *ConnectionClient) std.Io.Reader.Error!usize {
+        const r = &c.reader;
+
+        const input = c.input;
+
+        log.debug("input buf: {any}", .{input.buffered()});
+
+        const packet_size = input.peekInt(u32, .big) catch |err| return err;
+        const packet_end = packet_size + 4;
+
+        log.debug("Received packet of size {d}", .{packet_size});
+        if (packet_end > input.bufferedLen()) {
+            log.debug("Filling more as packet is not completely buffered: packet end = {d}, buf len = {d}", .{ packet_end, input.bufferedLen() });
+            try input.fillMore();
+
+            // Packet not well read; returning 0.
+            if (packet_end > input.bufferedLen()) return 0;
+        }
+        log.debug("prepped buffer: {any}", .{input.buffered()});
+
+        rebase(r, packet_end);
+        const buf = try input.take(packet_end); // already peaked
+
+        @memcpy(r.buffer[r.end..][0..packet_end], buf);
+
+        // Should be packet size but it's not wrapped yet
+        r.end += packet_end;
+
+        return packet_end;
+    }
+
+    fn rebase(r: *std.Io.Reader, capacity: usize) void {
+        if (r.buffer.len - r.end >= capacity) return;
+        log.debug("rebasing..", .{});
+        const data = r.buffer[r.seek..r.end];
+        @memmove(r.buffer[0..data.len], data);
+        r.seek = 0;
+        r.end = data.len;
+        std.debug.assert(r.buffer.len - r.end >= capacity);
+    }
+
+    fn drain(w: *std.Io.Writer, data: []const []const u8, splat: usize) std.Io.Writer.Error!usize {
+        const c: *ConnectionClient = @alignCast(@fieldParentPtr("writer", w));
+        const output = c.output;
+        const output_buffer = try output.writableSliceGreedy(100); // min_buffer_len
+
+        var end: usize = 0;
+        done: {
+            {
+                const buf = w.buffered();
+                @memcpy(output_buffer[end..buf.len], buf);
+                end += buf.len;
+                log.debug("wrote {d} (end={d}) bytes: {any}", .{ buf.len, end, buf });
+                if (buf.len < buf.len) break :done;
+            }
+            for (data[0 .. data.len - 1]) |buf| {
+                @memcpy(output_buffer[end..buf.len], buf);
+                end += buf.len;
+                log.debug("wrote {d} (end={d}) bytes: {any}", .{ buf.len, end, buf });
+                if (buf.len < buf.len) break :done;
+            }
+            const buf = data[data.len - 1];
+            for (0..splat) |_| {
+                @memcpy(output_buffer[end..buf.len], buf);
+                end += buf.len;
+                log.debug("wrote {d} (end={d}) bytes: {any}", .{ buf.len, end, buf });
+                if (buf.len < buf.len) break :done;
+            }
+        }
+
+        output.advance(end);
+        return w.consume(end);
+    }
+
+    fn flush(w: *std.Io.Writer) std.Io.Writer.Error!void {
+        const c: *ConnectionClient = @alignCast(@fieldParentPtr("writer", w));
+        const output = c.output;
+        const output_buffer = try output.writableSliceGreedy(100); // min_buffer_len
+        const buf = w.buffered();
+
+        log.debug("flushing {any}", .{buf});
+        @memcpy(output_buffer[0..buf.len], buf);
+        output.advance(buf.len);
+        w.end = 0;
+    }
 };
