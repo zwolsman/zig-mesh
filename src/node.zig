@@ -143,9 +143,33 @@ pub const Node = struct {
         defer peer.close();
         defer self.peer_store.remove(peer) catch unreachable;
 
-        peer.run() catch |err| {
-            log.debug("Failed to run peer: {}", .{err});
-        };
+        var tcp_read_buffer: [1024]u8 = undefined;
+        var tcp_write_buffer: [1024]u8 = undefined;
+
+        var tcp_reader = self.stream.reader(self.rt, &tcp_read_buffer);
+        var tcp_writer = self.stream.writer(self.rt, &tcp_write_buffer);
+
+        var read_buffer: [1024]u8 = undefined;
+        var write_buffer: [1024]u8 = undefined;
+        var connection_client = ConnectionClient.init(&tcp_reader.interface, &tcp_writer.interface, &read_buffer, &write_buffer);
+
+        while (true) {
+            const packet = readPacket(self.allocator, &connection_client.reader) catch |err| switch (err) {
+                error.EndOfStream => break,
+                else => return err,
+            };
+            defer self.allocator.free(packet);
+
+            log.debug("raw tcp read buf: {any}", .{tcp_read_buffer});
+            log.debug("tcp read buf: {any}", .{tcp_reader.interface.buffered()});
+
+            log.debug("raw conn read buf: {any}", .{read_buffer});
+            log.debug("conn read buf: {any}", .{connection_client.reader.buffered()});
+
+            log.debug("Received: {s} ({any})", .{ packet, packet });
+        }
+
+        log.debug("Stopped listening {f}", .{self.id});
     }
 };
 
@@ -171,39 +195,6 @@ const Peer = struct {
         };
 
         return peer;
-    }
-
-    const buf_size = 20;
-    fn run(self: *Peer) !void {
-        log.debug("Listening {f}", .{self.id});
-
-        var tcp_read_buffer: [buf_size]u8 = undefined;
-        var tcp_write_buffer: [buf_size]u8 = undefined;
-
-        var tcp_reader = self.stream.reader(self.rt, &tcp_read_buffer);
-        var tcp_writer = self.stream.writer(self.rt, &tcp_write_buffer);
-
-        var read_buffer: [buf_size]u8 = undefined;
-        var write_buffer: [buf_size]u8 = undefined;
-        var connection_client = ConnectionClient.init(&tcp_reader.interface, &tcp_writer.interface, &read_buffer, &write_buffer);
-
-        while (true) {
-            const packet = readPacket(self.allocator, &connection_client.reader) catch |err| switch (err) {
-                error.EndOfStream => break,
-                else => return err,
-            };
-            defer self.allocator.free(packet);
-
-            log.debug("raw tcp read buf: {any}", .{tcp_read_buffer});
-            log.debug("tcp read buf: {any}", .{tcp_reader.interface.buffered()});
-
-            log.debug("raw conn read buf: {any}", .{read_buffer});
-            log.debug("conn read buf: {any}", .{connection_client.reader.buffered()});
-
-            log.debug("Received: {s} ({any})", .{ packet, packet });
-        }
-
-        log.debug("Stopped listening {f}", .{self.id});
     }
 
     fn handshake(rt: *zio.Runtime, stream: zio.net.Stream, id: ID, role: HandshakeRole) !ID {
