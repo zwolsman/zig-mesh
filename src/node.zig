@@ -156,37 +156,33 @@ pub const Node = struct {
         var connection_client = ConnectionClient.init(&tcp_reader.interface, &tcp_writer.interface, &read_buffer, &write_buffer);
 
         while (true) {
-            const op, const tag, const payload = Packet.readPacket(&connection_client.reader) catch |err| switch (err) {
+            const op, const tag = Packet.readPacket(&connection_client.reader) catch |err| switch (err) {
                 error.EndOfStream => break,
                 else => return err,
             };
-            log.debug("Received packet {}({}) {any}", .{ op, tag, payload });
-            var payload_reader = std.Io.Reader.fixed(payload);
+            log.debug("Received packet {}({})", .{ op, tag });
 
-            self.handleServerPacket(peer, op, tag, &payload_reader) catch |err| {
+            self.handleServerPacket(peer, op, tag) catch |err| {
                 log.warn("Could not handle packet {}({}): {}", .{ op, tag, err });
                 continue;
             };
-
-            std.debug.assert(payload_reader.bufferedLen() == 0); // Should always consume full payload
         }
 
         log.debug("Stopped listening {f}", .{self.id});
     }
 
-    fn handleServerPacket(node: *Node, peer: *Peer, op: Packet.Op, tag: Packet.Tag, payload: *std.Io.Reader) !void {
+    fn handleServerPacket(node: *Node, peer: *Peer, op: Packet.Op, tag: Packet.Tag) !void {
         // TODO: handle server packet!
         _ = node; // autofix
         _ = peer; // autofix
 
         switch (tag) {
-            .echo => {
+            .echo => |payload| {
                 if (op != .command) {
                     return error.UnexpectedOp;
                 }
 
-                const frame = try Packet.Echo.readFrom(payload);
-                std.debug.print("Echo: {s}\n", .{frame.msg});
+                std.debug.print("Echo: {s}\n", .{payload.message});
             },
             .ping => {
                 if (op != .command) {

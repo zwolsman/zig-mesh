@@ -206,12 +206,10 @@ fn tty(allocator: std.mem.Allocator, rt: *zio.Runtime, node: *Node) !void {
             const msg = try allocator.dupe(u8, tokens.rest());
             defer allocator.free(msg);
 
-            const payload = Packet.Echo{ .msg = msg };
-
-            try Packet.writePacket(&peer.conn.writer, .command, .echo, payload);
+            try Packet.writePacket(&peer.conn.writer, .command, .{ .echo = .{ .message = msg } });
             try peer.conn.output.flush();
 
-            log.debug("Echo sent: {s}!", .{payload.msg});
+            log.debug("Echo sent: {s}!", .{msg});
         } else if (std.mem.eql(u8, upper_cmd, "PING")) {
             const dest_id = try parsePeerId(&tokens);
 
@@ -221,7 +219,7 @@ fn tty(allocator: std.mem.Allocator, rt: *zio.Runtime, node: *Node) !void {
             };
 
             log.debug("Found peer: {f}.. writing", .{peer.id});
-            try Packet.writePacket(&peer.conn.writer, .command, .ping, null);
+            try Packet.writePacket(&peer.conn.writer, .command, .ping);
             try peer.conn.output.flush();
 
             log.debug("Ping sent!", .{});
