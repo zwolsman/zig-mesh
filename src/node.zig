@@ -178,9 +178,25 @@ pub const Node = struct {
         // TODO: handle server packet!
         _ = node; // autofix
         _ = peer; // autofix
-        _ = op; // autofix
-        _ = tag; // autofix
-        _ = payload; // autofix
+
+        switch (tag) {
+            .echo => {
+                if (op != .command) {
+                    return error.UnexpectedOp;
+                }
+
+                const frame = try Packet.Echo.readFrom(payload);
+                std.debug.print("Echo: {s}\n", .{frame.msg});
+            },
+            .ping => {
+                if (op != .command) {
+                    return error.UnexpectedOp;
+                }
+
+                // TODO: send PONG back
+            },
+            else => return error.UnknownTag,
+        }
     }
 };
 
@@ -193,16 +209,35 @@ const Peer = struct {
     id: ID,
     allocator: std.mem.Allocator,
 
+    tcp_read_buffer: [1024]u8,
+    tcp_write_buffer: [1024]u8,
+
+    conn_read_buffer: [1024]u8,
+    conn_write_buffer: [1024]u8,
+
+    reader: zio.net.Stream.Reader,
+    writer: zio.net.Stream.Writer,
+
+    conn: ConnectionClient,
+
     pub const Error = error{HandshakeFailed};
 
     pub fn init(allocator: std.mem.Allocator, rt: *zio.Runtime, stream: zio.net.Stream, id: ID) !*Peer {
         const peer = try allocator.create(Peer);
+        errdefer allocator.destroy(peer);
 
         peer.* = .{
             .rt = rt,
             .id = id,
             .stream = stream,
             .allocator = allocator,
+            .tcp_read_buffer = undefined,
+            .tcp_write_buffer = undefined,
+            .conn_read_buffer = undefined,
+            .conn_write_buffer = undefined,
+            .reader = stream.reader(rt, &peer.tcp_read_buffer),
+            .writer = stream.writer(rt, &peer.tcp_write_buffer),
+            .conn = ConnectionClient.init(&peer.reader.interface, &peer.writer.interface, &peer.conn_read_buffer, &peer.conn_write_buffer),
         };
 
         return peer;

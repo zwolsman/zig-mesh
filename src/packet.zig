@@ -21,9 +21,12 @@ pub fn writePacket(writer: *std.Io.Writer, op: Op, tag: Tag, payload: anytype) !
     var packet_buffer: [MAX_PACKET_SIZE]u8 = undefined;
     var packet_writer = std.Io.Writer.fixed(&packet_buffer);
 
-    if (payload) |p| {
-        try p.writeTo(packet_writer);
+    if (@TypeOf(payload) != @TypeOf(null)) {
+        try payload.writeTo(&packet_writer);
     }
+    // if (payload) |p| {
+
+    // }
 
     const packet_data = packet_writer.buffered();
 
@@ -45,8 +48,8 @@ pub fn readPacket(reader: *std.Io.Reader) !struct { Op, Tag, []u8 } {
     std.debug.assert(version == PACKET_VERSION);
 
     const len = try reader.takeInt(u16, .big);
-    const op: Packet.Op = @enumFromInt(try reader.takeInt(u8, .big));
-    const tag: Packet.Tag = @enumFromInt(try reader.takeInt(u8, .big));
+    const op: Op = @enumFromInt(try reader.takeInt(u8, .big));
+    const tag: Tag = @enumFromInt(try reader.takeInt(u8, .big));
     const data = try reader.take(len);
 
     return .{ op, tag, data };
@@ -56,9 +59,9 @@ pub const Echo = struct {
     msg: []u8,
 
     pub fn writeTo(self: Echo, writer: *std.Io.Writer) !void {
-        writer.writeInt(u16, @intCast(self.msg.len), .big);
-        writer.writeAll(self.msg);
-        writer.flush();
+        try writer.writeInt(u16, @intCast(self.msg.len), .big);
+        try writer.writeAll(self.msg);
+        try writer.flush();
     }
 
     pub fn readFrom(reader: *std.Io.Reader) !Echo {

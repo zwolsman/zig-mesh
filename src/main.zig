@@ -114,7 +114,7 @@ pub fn main() !void {
     bootstrap_job.detach(rt);
 
     if (options.interactive) {
-        var tty_job = try rt.spawn(tty, .{ rt, &node }, .{});
+        var tty_job = try rt.spawn(tty, .{ allocator, rt, &node }, .{});
         tty_job.detach(rt);
     }
 
@@ -145,7 +145,7 @@ fn bootstrapNode(rt: *zio.Runtime, node: *Node, bootstrap_addresses: []const []c
     std.log.debug("Finished bootstrapping", .{});
 }
 
-fn tty(rt: *zio.Runtime, node: *Node) !void {
+fn tty(allocator: std.mem.Allocator, rt: *zio.Runtime, node: *Node) !void {
     const log = std.log.scoped(.tty);
     log.debug("Waiting for command..", .{});
     var in = zio.Pipe.init(std.fs.File.stdin());
@@ -194,60 +194,7 @@ fn tty(rt: *zio.Runtime, node: *Node) !void {
 
             std.debug.print("Connected to peer {f}\n", .{peer.id});
         } else if (std.mem.eql(u8, upper_cmd, "ECHO")) {
-            // const raw_dest_id = tokens.next() orelse {
-            //     log.warn("No destination id provided; ping <dest id>", .{});
-            //     continue;
-            // };
-
-            // if (raw_dest_id.len != 64) {
-            //     log.warn("Destination id not 64 chars", .{});
-            //     continue;
-            // }
-
-            // var dest_id: [32]u8 = undefined;
-            // _ = try std.fmt.hexToBytes(&dest_id, raw_dest_id);
-
-            // const peer = node.peer_store.key_peer.get(dest_id) orelse {
-            //     log.warn("Not connected to {x}", .{dest_id});
-            //     continue;
-            // };
-
-            // log.debug("Found peer: {f}.. writing", .{peer.id});
-
-            // var tcp_read_buffer: [1024]u8 = undefined;
-            // var tcp_write_buffer: [1024]u8 = undefined;
-            // var read_buffer: [1024]u8 = undefined;
-            // var write_buffer: [1024]u8 = undefined;
-
-            // var tcp_writer = peer.stream.writer(rt, &tcp_write_buffer);
-            // var tcp_reader = peer.stream.reader(rt, &tcp_read_buffer);
-
-            // var connection_client = @import("./node.zig").ConnectionClient.init(&tcp_reader.interface, &tcp_writer.interface, &read_buffer, &write_buffer);
-
-            // const payload = Packet.Echo{ .msg = tokens.rest() };
-            // try Packet.writePacket(&connection_client.writer, .command, .echo, payload);
-
-            // log.debug("connection buffer: {any}", .{connection_client.writer.buffered()});
-            // log.debug("tcp buffer: {any}", .{tcp_writer.interface.buffered()});
-            // try connection_client.writer.flush();
-            // log.debug("Flushed connection", .{});
-            // log.debug("tcp buffer: {any}", .{tcp_writer.interface.buffered()});
-            // try tcp_writer.interface.flush();
-
-            // log.debug("Ping sent!", .{});
-        } else if (std.mem.eql(u8, upper_cmd, "PING")) {
-            const raw_dest_id = tokens.next() orelse {
-                log.warn("No destination id provided; ping <dest id>", .{});
-                continue;
-            };
-
-            if (raw_dest_id.len != 64) {
-                log.warn("Destination id not 64 chars", .{});
-                continue;
-            }
-
-            var dest_id: [32]u8 = undefined;
-            _ = try std.fmt.hexToBytes(&dest_id, raw_dest_id);
+            const dest_id = try parsePeerId(&tokens);
 
             const peer = node.peer_store.key_peer.get(dest_id) orelse {
                 log.warn("Not connected to {x}", .{dest_id});
@@ -256,28 +203,45 @@ fn tty(rt: *zio.Runtime, node: *Node) !void {
 
             log.debug("Found peer: {f}.. writing", .{peer.id});
 
-            var tcp_read_buffer: [1024]u8 = undefined;
-            var tcp_write_buffer: [1024]u8 = undefined;
-            var read_buffer: [1024]u8 = undefined;
-            var write_buffer: [1024]u8 = undefined;
+            const msg = try allocator.dupe(u8, tokens.rest());
+            defer allocator.free(msg);
 
-            var tcp_writer = peer.stream.writer(rt, &tcp_write_buffer);
-            var tcp_reader = peer.stream.reader(rt, &tcp_read_buffer);
+            const payload = Packet.Echo{ .msg = msg };
 
-            var connection_client = @import("./node.zig").ConnectionClient.init(&tcp_reader.interface, &tcp_writer.interface, &read_buffer, &write_buffer);
+            try Packet.writePacket(&peer.conn.writer, .command, .echo, payload);
+            try peer.conn.output.flush();
 
-            try Packet.writePacket(&connection_client.writer, .command, .ping, null);
+            log.debug("Echo sent: {s}!", .{payload.msg});
+        } else if (std.mem.eql(u8, upper_cmd, "PING")) {
+            const dest_id = try parsePeerId(&tokens);
 
-            log.debug("connection buffer: {any}", .{connection_client.writer.buffered()});
-            log.debug("tcp buffer: {any}", .{tcp_writer.interface.buffered()});
-            try connection_client.writer.flush();
-            log.debug("Flushed connection", .{});
-            log.debug("tcp buffer: {any}", .{tcp_writer.interface.buffered()});
-            try tcp_writer.interface.flush();
+            const peer = node.peer_store.key_peer.get(dest_id) orelse {
+                log.warn("Not connected to {x}", .{dest_id});
+                continue;
+            };
+
+            log.debug("Found peer: {f}.. writing", .{peer.id});
+            try Packet.writePacket(&peer.conn.writer, .command, .ping, null);
+            try peer.conn.output.flush();
 
             log.debug("Ping sent!", .{});
         } else {
             std.debug.print("Unknown command: {s}\n", .{upper_cmd});
         }
     }
+}
+
+fn parsePeerId(it: *std.mem.TokenIterator(u8, .scalar)) ![32]u8 {
+    const raw_dest_id = it.next() orelse {
+        return error.MissingPeerId;
+    };
+
+    if (raw_dest_id.len != 64) {
+        std.log.warn("Destination id not 64 chars", .{});
+        return error.PeerIdLengthMismatch;
+    }
+
+    var peer_id: [32]u8 = undefined;
+    _ = try std.fmt.hexToBytes(&peer_id, raw_dest_id);
+    return peer_id;
 }
