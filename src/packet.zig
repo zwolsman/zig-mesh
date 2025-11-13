@@ -21,23 +21,15 @@ pub const Tag = union(PacketType) {
 const MAX_PACKET_SIZE = 128;
 const PACKET_VERSION: u8 = 1;
 
-pub const HEADER_LEN = 5;
+pub const HEADER_LEN = 3; // version(u8) + len(u16)
 
 pub fn writePacket(writer: *std.Io.Writer, op: Op, tag: Tag) !void {
-    var packet_buffer: [MAX_PACKET_SIZE]u8 = undefined;
-    var packet_writer = std.Io.Writer.fixed(&packet_buffer);
-
-    try writeTag(&packet_writer, tag);
-    const packet_data = packet_writer.buffered();
-
     // Header
-    try writer.writeInt(u8, 1, .big); // version always set to 1
-    try writer.writeInt(u16, @intCast(packet_data.len), .big); // TODO: move to connection client
     try writer.writeInt(u8, @intFromEnum(op), .big);
     try writer.writeInt(u8, @intFromEnum(tag), .big);
 
     // Body
-    try writer.writeAll(packet_data);
+    try writeTag(writer, tag);
     try writer.flush();
 }
 
@@ -52,14 +44,6 @@ fn writeTag(writer: *std.Io.Writer, tag: Tag) !void {
 }
 
 pub fn readPacket(reader: *std.Io.Reader) !struct { Op, Tag } {
-    std.log.debug("Trying to read packet..", .{});
-
-    const version = try reader.takeInt(u8, .big);
-    std.debug.assert(version == PACKET_VERSION); // TODO: deprecated; handled in connection client!
-
-    const len = try reader.takeInt(u16, .big);
-    _ = len; // TODO: deprecated; handled in connection client!
-
     const op: Op = @enumFromInt(try reader.takeInt(u8, .big));
     const packet_type: PacketType = @enumFromInt(try reader.takeInt(u8, .big));
 

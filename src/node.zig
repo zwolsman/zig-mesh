@@ -126,7 +126,7 @@ pub const Node = struct {
     fn acceptPeer(self: *Self, rt: *zio.Runtime, stream: zio.net.Stream, role: HandshakeRole) !*Peer {
         const peerId = try Peer.handshake(rt, stream, self.id, role);
 
-        const peer = try Peer.init(self.allocator, rt, stream, peerId);
+        const peer = Peer.init(try self.allocator.create(Peer), rt, stream, peerId);
         log.debug("Peer handshake: {f} (ok)", .{peer.id});
 
         var peer_job = try rt.spawn(peerLoop, .{ self, rt, peer }, .{});
@@ -203,7 +203,6 @@ const Peer = struct {
     rt: *zio.Runtime,
     stream: zio.net.Stream,
     id: ID,
-    allocator: std.mem.Allocator,
 
     tcp_read_buffer: [1024]u8,
     tcp_write_buffer: [1024]u8,
@@ -218,15 +217,11 @@ const Peer = struct {
 
     pub const Error = error{HandshakeFailed};
 
-    pub fn init(allocator: std.mem.Allocator, rt: *zio.Runtime, stream: zio.net.Stream, id: ID) !*Peer {
-        const peer = try allocator.create(Peer);
-        errdefer allocator.destroy(peer);
-
+    pub fn init(peer: *Peer, rt: *zio.Runtime, stream: zio.net.Stream, id: ID) *Peer {
         peer.* = .{
             .rt = rt,
             .id = id,
             .stream = stream,
-            .allocator = allocator,
             .tcp_read_buffer = undefined,
             .tcp_write_buffer = undefined,
             .conn_read_buffer = undefined,
@@ -418,14 +413,19 @@ pub const ConnectionClient = struct {
 
     fn readIndirect(c: *ConnectionClient) std.Io.Reader.Error!usize {
         const r = &c.reader;
-
         const input = c.input;
 
         log.debug("input buf: {any}", .{input.buffered()});
 
         const packet_header = try input.peek(Packet.HEADER_LEN);
+        const packet_version = std.mem.readInt(u8, packet_header[0..1], .big);
         const packet_size = std.mem.readInt(u16, packet_header[1..3], .big);
         const packet_end = packet_size + Packet.HEADER_LEN;
+
+        log.debug("peeked (version={d}, size={d}, end={d}) {any}", .{ packet_version, packet_size, packet_end, packet_header });
+        log.debug("buffer: {any}", .{input.buffered()});
+
+        std.debug.assert(packet_version == 1);
 
         log.debug("Received packet of size {d}", .{packet_size});
         if (packet_end > input.bufferedLen()) {
@@ -438,13 +438,14 @@ pub const ConnectionClient = struct {
         log.debug("prepped buffer: {any}", .{input.buffered()});
 
         rebase(r, packet_end);
-        const buf = try input.take(packet_end); // already peaked
+        _ = try input.take(Packet.HEADER_LEN); // already peaked
+        const buf = try input.take(packet_size); // actual packet
 
-        @memcpy(r.buffer[r.end..][0..packet_end], buf);
+        @memcpy(r.buffer[r.end..][0..packet_size], buf);
 
         // Should be packet size but it's not wrapped yet
-        r.end += packet_end;
-        return packet_end;
+        r.end += packet_size;
+        return packet_size;
     }
 
     fn rebase(r: *std.Io.Reader, capacity: usize) void {
@@ -461,32 +462,36 @@ pub const ConnectionClient = struct {
         const output = c.output;
         const output_buffer = try output.writableSliceGreedy(100); // min_buffer_len
 
-        var end: usize = 0;
+        var in_end: usize = 0;
+        var buf_end: usize = 0;
         done: {
             {
                 const buf = w.buffered();
-                @memcpy(output_buffer[end..buf.len], buf);
-                end += buf.len;
-                log.debug("wrote {d} (end={d}) bytes: {any}", .{ buf.len, end, buf });
-                if (buf.len < buf.len) break :done;
+                const in_len, const buf_len = try writePacket(output_buffer[buf_end..], buf);
+
+                buf_end += buf_len;
+                in_end += in_len;
+                if (in_len < buf.len) break :done;
             }
             for (data[0 .. data.len - 1]) |buf| {
-                @memcpy(output_buffer[end..buf.len], buf);
-                end += buf.len;
-                log.debug("wrote {d} (end={d}) bytes: {any}", .{ buf.len, end, buf });
-                if (buf.len < buf.len) break :done;
+                const in_len, const buf_len = try writePacket(output_buffer[buf_end..], buf);
+
+                buf_end += buf_len;
+                in_end += in_len;
+                if (in_len < buf.len) break :done;
             }
             const buf = data[data.len - 1];
             for (0..splat) |_| {
-                @memcpy(output_buffer[end..buf.len], buf);
-                end += buf.len;
-                log.debug("wrote {d} (end={d}) bytes: {any}", .{ buf.len, end, buf });
-                if (buf.len < buf.len) break :done;
+                const in_len, const buf_len = try writePacket(output_buffer[buf_end..], buf);
+
+                buf_end += buf_len;
+                in_end += in_len;
+                if (in_len < buf.len) break :done;
             }
         }
 
-        output.advance(end);
-        return w.consume(end);
+        output.advance(buf_end);
+        return w.consume(in_end);
     }
 
     fn flush(w: *std.Io.Writer) std.Io.Writer.Error!void {
@@ -495,9 +500,22 @@ pub const ConnectionClient = struct {
         const output_buffer = try output.writableSliceGreedy(100); // min_buffer_len
         const buf = w.buffered();
 
-        log.debug("flushing {any}", .{buf});
-        @memcpy(output_buffer[0..buf.len], buf);
-        output.advance(buf.len);
+        _, const buf_len = try writePacket(output_buffer, buf);
+
+        log.debug("flushing {any}", .{output_buffer[0..buf_len]});
+        output.advance(buf_len);
         w.end = 0;
+    }
+
+    fn writePacket(output: []u8, data: []const u8) !struct { usize, usize } {
+        var writer = std.Io.Writer.fixed(output);
+        try writer.writeInt(u8, 1, .big); // version always set to 1
+        try writer.writeInt(u16, @intCast(data.len), .big);
+        const len = try writer.write(data);
+
+        return .{
+            len,
+            len + Packet.HEADER_LEN,
+        };
     }
 };
