@@ -136,6 +136,7 @@ pub const Node = struct {
     }
 
     fn peerLoop(self: *Self, rt: *zio.Runtime, peer: *Peer) !void {
+        _ = rt; // autofix
         self.peer_store.register(peer) catch |err| {
             log.warn("Could not register peer {f}: {} -- diconnecting", .{ peer.id, err });
             peer.close();
@@ -145,24 +146,14 @@ pub const Node = struct {
         defer peer.close();
         defer self.peer_store.remove(peer) catch unreachable;
 
-        var tcp_read_buffer: [1024]u8 = undefined;
-        var tcp_write_buffer: [1024]u8 = undefined;
-
-        var tcp_reader = peer.stream.reader(rt, &tcp_read_buffer);
-        var tcp_writer = peer.stream.writer(rt, &tcp_write_buffer);
-
-        var read_buffer: [1024]u8 = undefined;
-        var write_buffer: [1024]u8 = undefined;
-        var connection_client = ConnectionClient.init(&tcp_reader.interface, &tcp_writer.interface, &read_buffer, &write_buffer);
-
         while (true) {
-            const op, const tag = Packet.readPacket(&connection_client.reader) catch |err| switch (err) {
+            const op, const tag = Packet.readPacket(&peer.conn.reader) catch |err| switch (err) {
                 error.EndOfStream => break,
                 else => return err,
             };
             log.debug("Received packet {}({})", .{ op, tag });
 
-            self.handleServerPacket(peer, op, tag) catch |err| {
+            self.nodePacketHandler(peer, op, tag) catch |err| {
                 log.warn("Could not handle packet {}({}): {}", .{ op, tag, err });
                 continue;
             };
@@ -171,10 +162,8 @@ pub const Node = struct {
         log.debug("Stopped listening {f}", .{self.id});
     }
 
-    fn handleServerPacket(node: *Node, peer: *Peer, op: Packet.Op, tag: Packet.Tag) !void {
-        // TODO: handle server packet!
+    fn nodePacketHandler(node: *Node, peer: *Peer, op: Packet.Op, tag: Packet.Tag) !void {
         _ = node; // autofix
-        _ = peer; // autofix
 
         switch (tag) {
             .echo => |payload| {
@@ -182,14 +171,15 @@ pub const Node = struct {
                     return error.UnexpectedOp;
                 }
 
-                std.debug.print("Echo: {s}\n", .{payload.message});
+                log.debug("{f}: {s}", .{ peer.id, payload.message });
             },
             .ping => {
                 if (op != .command) {
                     return error.UnexpectedOp;
                 }
-
-                // TODO: send PONG back
+                log.debug("{f}: ping", .{peer.id});
+                try Packet.writePacket(&peer.conn.writer, .command, .pong);
+                try peer.conn.output.flush();
             },
             else => return error.UnknownTag,
         }

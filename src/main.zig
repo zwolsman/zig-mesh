@@ -223,6 +223,10 @@ fn tty(allocator: std.mem.Allocator, rt: *zio.Runtime, node: *Node) !void {
             try peer.conn.output.flush();
 
             log.debug("Ping sent!", .{});
+
+            // TODO: receive response and assert
+            // const response = try Packet.readPacket(&peer.conn.reader);
+            // log.debug("Received response: {any}", .{response});
         } else {
             std.debug.print("Unknown command: {s}\n", .{upper_cmd});
         }
