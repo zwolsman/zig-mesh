@@ -219,7 +219,7 @@ fn tty(allocator: std.mem.Allocator, rt: *zio.Runtime, node: *Node) !void {
             };
 
             log.debug("Found peer: {f}.. writing", .{peer.id});
-            try Packet.writePacket(&peer.conn.writer, .command, .ping);
+            try Packet.writePacket(&peer.conn.writer, .request, .ping);
             try peer.conn.output.flush();
 
             log.debug("Ping sent!", .{});

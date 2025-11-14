@@ -176,14 +176,15 @@ pub const Node = struct {
                 log.debug("{f}: {s}", .{ peer.id, payload.message });
             },
             .ping => {
-                if (op != .command) {
+                if (op != .request) {
                     return error.UnexpectedOp;
                 }
                 log.debug("{f}: ping", .{peer.id});
-                try Packet.writePacket(&peer.conn.writer, .command, .pong);
+
+                try Packet.writePacket(&peer.conn.writer, .{ .response = op.request }, .ping);
                 try peer.conn.output.flush();
             },
-            else => return error.UnknownTag,
+            // else => return error.UnknownTag,
         }
     }
 };

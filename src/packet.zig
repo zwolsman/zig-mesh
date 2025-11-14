@@ -1,20 +1,26 @@
 const std = @import("std");
 
-pub const Op = enum(u8) {
+const ID = [16]u8;
+
+pub const OpType = enum {
     request,
     response,
     command,
 };
 
+pub const Op = union(OpType) {
+    request: ID,
+    response: ID,
+    command: void,
+};
+
 const PacketType = enum {
     ping,
-    pong,
     echo,
 };
 
 pub const Tag = union(PacketType) {
     ping: void,
-    pong: void,
     echo: struct { message: []u8 },
 };
 
@@ -23,9 +29,24 @@ const PACKET_VERSION: u8 = 1;
 
 pub const HEADER_LEN = 3; // version(u8) + len(u16)
 
-pub fn writePacket(writer: *std.Io.Writer, op: Op, tag: Tag) !void {
+pub fn writePacket(writer: *std.Io.Writer, op: union(OpType) {
+    request: void,
+    response: ID,
+    command: void,
+}, tag: Tag) !void {
     // Header
     try writer.writeInt(u8, @intFromEnum(op), .big);
+    switch (op) {
+        .command => {},
+        .request => {
+            var request_id: [16]u8 = undefined;
+            std.crypto.random.bytes(&request_id);
+            try writer.writeAll(&request_id);
+        },
+        .response => |id| {
+            try writer.writeAll(&id);
+        },
+    }
     try writer.writeInt(u8, @intFromEnum(tag), .big);
 
     // Body
@@ -35,7 +56,7 @@ pub fn writePacket(writer: *std.Io.Writer, op: Op, tag: Tag) !void {
 
 fn writeTag(writer: *std.Io.Writer, tag: Tag) !void {
     switch (tag) {
-        .ping, .pong => {},
+        .ping => {},
         .echo => |payload| {
             try writer.writeInt(u16, @intCast(payload.message.len), .big);
             try writer.writeAll(payload.message);
@@ -44,12 +65,23 @@ fn writeTag(writer: *std.Io.Writer, tag: Tag) !void {
 }
 
 pub fn readPacket(reader: *std.Io.Reader) !struct { Op, Tag } {
-    const op: Op = @enumFromInt(try reader.takeInt(u8, .big));
+    const op_type: OpType = @enumFromInt(try reader.takeInt(u8, .big));
+    const op = op: switch (op_type) {
+        .command => Op.command,
+        .request => {
+            const key = try reader.takeArray(@sizeOf(ID));
+            break :op Op{ .request = key.* };
+        },
+        .response => {
+            const key = try reader.takeArray(@sizeOf(ID));
+            break :op Op{ .response = key.* };
+        },
+    };
+
     const packet_type: PacketType = @enumFromInt(try reader.takeInt(u8, .big));
 
     const tag = read_tag: switch (packet_type) {
         .ping => Tag.ping,
-        .pong => Tag.pong,
         .echo => {
             const msg_len = try reader.takeInt(u16, .big);
             break :read_tag Tag{ .echo = .{ .message = try reader.take(msg_len) } };
