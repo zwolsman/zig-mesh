@@ -1,6 +1,6 @@
 const std = @import("std");
 
-const ID = [16]u8;
+pub const ID = [16]u8;
 
 pub const OpType = enum {
     request,
@@ -33,25 +33,31 @@ pub fn writePacket(writer: *std.Io.Writer, op: union(OpType) {
     request: void,
     response: ID,
     command: void,
-}, tag: Tag) !void {
+}, tag: Tag) !?ID { // TODO: make an either type, only requests will result into an ID
     // Header
     try writer.writeInt(u8, @intFromEnum(op), .big);
-    switch (op) {
-        .command => {},
-        .request => {
+
+    const id = switch (op) {
+        .command => null,
+        .request => id: {
             var request_id: [16]u8 = undefined;
             std.crypto.random.bytes(&request_id);
             try writer.writeAll(&request_id);
+            break :id request_id;
         },
-        .response => |id| {
+        .response => |id| request_id: {
             try writer.writeAll(&id);
+            break :request_id null;
         },
-    }
+    };
+
     try writer.writeInt(u8, @intFromEnum(tag), .big);
 
     // Body
     try writeTag(writer, tag);
     try writer.flush();
+
+    return id;
 }
 
 fn writeTag(writer: *std.Io.Writer, tag: Tag) !void {

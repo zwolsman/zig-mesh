@@ -206,7 +206,7 @@ fn tty(allocator: std.mem.Allocator, rt: *zio.Runtime, node: *Node) !void {
             const msg = try allocator.dupe(u8, tokens.rest());
             defer allocator.free(msg);
 
-            try Packet.writePacket(&peer.conn.writer, .command, .{ .echo = .{ .message = msg } });
+            _ = try Packet.writePacket(&peer.conn.writer, .command, .{ .echo = .{ .message = msg } });
             try peer.conn.output.flush();
 
             log.debug("Echo sent: {s}!", .{msg});
@@ -219,14 +219,21 @@ fn tty(allocator: std.mem.Allocator, rt: *zio.Runtime, node: *Node) !void {
             };
 
             log.debug("Found peer: {f}.. writing", .{peer.id});
-            try Packet.writePacket(&peer.conn.writer, .request, .ping);
+            const req_id = (try Packet.writePacket(&peer.conn.writer, .request, .ping)).?;
             try peer.conn.output.flush();
 
-            log.debug("Ping sent!", .{});
+            log.debug("Ping sent (id={x})!", .{req_id});
 
-            // TODO: receive response and assert
-            // const response = try Packet.readPacket(&peer.conn.reader);
-            // log.debug("Received response: {any}", .{response});
+            // TODO: add time-out handling
+            var resp_task = try rt.spawn(@import("./node.zig").Peer.receiveResponse, .{ peer, rt, req_id }, .{});
+            defer resp_task.cancel(rt);
+            const resp_id: Packet.ID, const resp: Packet.Tag = try resp_task.join(rt);
+
+            if (resp != .ping) {
+                log.debug("Unexpected op: {}", .{resp});
+            } else {
+                log.debug("Received ping response (id={x})", .{&resp_id});
+            }
         } else {
             std.debug.print("Unknown command: {s}\n", .{upper_cmd});
         }

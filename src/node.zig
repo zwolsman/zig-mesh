@@ -167,31 +167,33 @@ pub const Node = struct {
     fn nodePacketHandler(node: *Node, peer: *Peer, op: Packet.Op, tag: Packet.Tag) !void {
         _ = node; // autofix
 
-        switch (tag) {
-            .echo => |payload| {
-                if (op != .command) {
-                    return error.UnexpectedOp;
-                }
-
-                log.debug("{f}: {s}", .{ peer.id, payload.message });
+        switch (op) {
+            .command => switch (tag) {
+                .echo => |payload| {
+                    log.debug("{f}: {s}", .{ peer.id, payload.message });
+                },
+                else => return error.UnexpectedOp,
             },
-            .ping => {
-                if (op != .request) {
-                    return error.UnexpectedOp;
-                }
-                log.debug("{f}: ping", .{peer.id});
+            .request => switch (tag) {
+                .ping => {
+                    log.debug("{f}: ping", .{peer.id});
 
-                try Packet.writePacket(&peer.conn.writer, .{ .response = op.request }, .ping);
-                try peer.conn.output.flush();
+                    _ = try Packet.writePacket(&peer.conn.writer, .{ .response = op.request }, .ping);
+                    try peer.conn.output.flush();
+                },
+                else => return error.UnexpectedOp,
             },
-            // else => return error.UnknownTag,
+            .response => |request_id| {
+                try peer.responses.send(.{ request_id, tag });
+            },
         }
     }
 };
 
 const HandshakeRole = enum { initiator, responder };
-const Peer = struct {
+pub const Peer = struct {
     const log = std.log.scoped(.peer);
+    const ResponseChannel = zio.BroadcastChannel(struct { Packet.ID, Packet.Tag });
 
     rt: *zio.Runtime,
     stream: zio.net.Stream,
@@ -206,6 +208,9 @@ const Peer = struct {
     reader: zio.net.Stream.Reader,
     writer: zio.net.Stream.Writer,
 
+    responses_buffer: [16]struct { Packet.ID, Packet.Tag },
+    responses: ResponseChannel,
+
     conn: ConnectionClient,
 
     pub const Error = error{HandshakeFailed};
@@ -215,13 +220,20 @@ const Peer = struct {
             .rt = rt,
             .id = id,
             .stream = stream,
+
+            .responses_buffer = undefined,
+
             .tcp_read_buffer = undefined,
             .tcp_write_buffer = undefined,
+
             .conn_read_buffer = undefined,
             .conn_write_buffer = undefined,
+
             .reader = stream.reader(rt, &peer.tcp_read_buffer),
             .writer = stream.writer(rt, &peer.tcp_write_buffer),
+
             .conn = ConnectionClient.init(&peer.reader.interface, &peer.writer.interface, &peer.conn_read_buffer, &peer.conn_write_buffer),
+            .responses = ResponseChannel.init(&peer.responses_buffer),
         };
 
         return peer;
@@ -275,6 +287,24 @@ const Peer = struct {
                     .address = stream.socket.address,
                 };
             },
+        }
+    }
+
+    pub fn receiveResponse(peer: *Peer, rt: *zio.Runtime, id: Packet.ID) !struct { Packet.ID, Packet.Tag } {
+        var consumer = ResponseChannel.Consumer{};
+        peer.responses.subscribe(&consumer);
+        defer peer.responses.unsubscribe(&consumer);
+
+        while (peer.responses.receive(rt, &consumer)) |response| {
+            const resp_id, _ = response;
+
+            if (std.mem.eql(u8, &id, &resp_id)) {
+                return response;
+            }
+        } else |err| switch (err) {
+            // error.Closed => {},
+            // error.Lagged => {}, // Fell behind, continue from current position
+            else => return err,
         }
     }
 
