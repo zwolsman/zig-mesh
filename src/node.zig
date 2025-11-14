@@ -24,10 +24,12 @@ pub const Node = struct {
     id: ID,
     peer_store: PeerStore,
     server: ?zio.net.Server,
+    kp: std.crypto.sign.Ed25519.KeyPair,
 
     pub fn init(allocator: std.mem.Allocator, kp: std.crypto.sign.Ed25519.KeyPair) !Node {
         return .{
             .allocator = allocator,
+            .kp = kp,
             .id = .{
                 .public_key = kp.public_key.toBytes(),
                 .address = null,
@@ -415,7 +417,9 @@ pub const ConnectionClient = struct {
         log.debug("peeked (version={d}, size={d}, end={d}) {any}", .{ packet_version, packet_size, packet_end, packet_header });
         log.debug("buffer: {any}", .{input.buffered()});
 
-        std.debug.assert(packet_version == 1);
+        if (packet_version != 1) {
+            return error.ReadFailed;
+        }
 
         log.debug("Received packet of size {d}", .{packet_size});
         if (packet_end > input.bufferedLen()) {
