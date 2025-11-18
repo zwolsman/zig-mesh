@@ -96,6 +96,13 @@ pub const HandshakePatternName = enum {
     I1X,
     IX1,
     I1X1,
+
+    fn isOneWay(self: HandshakePatternName) bool {
+        return switch (self) {
+            .N, .X, .K => true,
+            else => false,
+        };
+    }
 };
 
 /// Choice of cipher in a noise protocol. These must be stylized like in the [protocol specification]
@@ -1569,6 +1576,55 @@ test "cacophony" {
         }
 
         try std.testing.expectEqualSlices(u8, initiator.handshakeHash(), responder.handshakeHash());
+        var split = std.mem.splitSequence(u8, protocol.pattern, "psk");
+        const is_one_way = if (std.meta.stringToEnum(HandshakePatternName, split.next().?)) |p|
+            p.isOneWay()
+        else
+            false;
+        // Transport phase
+        for (msg_idx..vector.messages.len) |k| {
+            const m = vector.messages[k];
+            var sender: *CipherState = undefined;
+            var receiver: *CipherState = undefined;
+            if (is_one_way) {
+                sender = &c1init;
+                receiver = &c2resp;
+            } else {
+                const is_initiator = k % 2 == 0;
+                sender = if (is_initiator) &c1init else &c1resp;
+                receiver = if (is_initiator) &c2resp else &c2init;
+            }
+            var payload_buf: [MAX_MESSAGE_LEN]u8 = undefined;
+            const payload = try std.fmt.hexToBytes(&payload_buf, m.payload);
+
+            const encrypted = sender.encryptWithAd(&buffer, &[_]u8{}, payload) catch |e| {
+                failed_vector_count += 1;
+                std.debug.print("Vector \"{s}\" ({}) failed at encryptWithAd for message {}\nErr = {any}", .{ vector.protocol_name, vector_num + 1, k, e });
+                continue :vector_test;
+            };
+
+            var expected_buf: [MAX_MESSAGE_LEN]u8 = undefined;
+            var expected = try std.fmt.hexToBytes(&expected_buf, m.ciphertext);
+            std.testing.expectEqualSlices(u8, expected, encrypted) catch {
+                failed_vector_count += 1;
+                std.debug.print("Vector \"{s}\" ({}) failed after encryptWithAd\n", .{ vector.protocol_name, vector_num + 1 });
+                continue :vector_test;
+            };
+
+            expected = try std.fmt.hexToBytes(&expected_buf, m.payload);
+
+            const decrypted = receiver.decryptWithAd(&buffer, &[_]u8{}, encrypted) catch |e| {
+                failed_vector_count += 1;
+                std.debug.print("Vector \"{s}\" ({}) failed at decryptWithAd for message {}\nErr = {any}", .{ vector.protocol_name, vector_num + 1, k, e });
+                continue :vector_test;
+            };
+            std.testing.expectEqualSlices(u8, expected, decrypted) catch {
+                failed_vector_count += 1;
+                std.debug.print("Vector \"{s}\" ({}) failed after decryptWithAd\n", .{ vector.protocol_name, vector_num + 1 });
+                continue :vector_test;
+            };
+            std.debug.print("Vector \"{s}\" ({}) message {} OK\n", .{ vector.protocol_name, vector_num + 1, k });
+        }
     }
     std.debug.print("***** {} out of {} vectors passed ({} ignored). *****\n", .{ total_vector_count - failed_vector_count - ignored_vector_count, total_vector_count, ignored_vector_count });
 }
