@@ -526,7 +526,7 @@ pub const SymmetricState = struct {
             chaining_key: []const u8,
             input_key_material: []const u8,
             num_outputs: u8,
-        ) []u8 {
+        ) ![]u8 {
             std.debug.assert(chaining_key.len == self.len);
             std.debug.assert(input_key_material.len == 0 or input_key_material.len == 32);
             std.debug.assert(output.len >= num_outputs * self.len);
@@ -553,11 +553,11 @@ pub const SymmetricState = struct {
                     .BLAKE2b => Blake2b.HKDF(chaining_key, input_key_material, num_outputs),
                     else => unreachable,
                 };
-                w.writeAll(&result.@"0") catch unreachable;
-                w.writeAll(&result.@"1") catch unreachable;
+                try w.writeAll(&result.@"0");
+                try w.writeAll(&result.@"1");
 
                 if (result.@"2") |o| {
-                    w.writeAll(&o) catch unreachable;
+                    try w.writeAll(&o);
                 }
             }
 
@@ -566,13 +566,13 @@ pub const SymmetricState = struct {
     };
 
     pub fn mixKey(self: *Self, input_key_material: []const u8) !void {
-        const keys = self.hasher.HKDF(&self.buffer, self.ck(), input_key_material, 2);
+        const keys_data = try self.hasher.HKDF(&self.buffer, self.ck(), input_key_material, 2);
+        var keys = std.Io.Reader.fixed(keys_data);
 
-        @memcpy(self._ck[0..self.hasher.len], keys[0..self.hasher.len]);
+        @memcpy(self._ck[0..self.hasher.len], try keys.take(self.hasher.len));
 
         // If HASHLEN is 64, then truncates temp_k to 32 bytes.
-        var temp_k: [32]u8 = undefined;
-        @memcpy(&temp_k, keys[self.hasher.len .. self.hasher.len + 32]);
+        const temp_k: [32]u8 = (try keys.takeArray(32)).*;
         self.cipher_state = try .init(self.cipher_choice, temp_k);
     }
 
@@ -602,12 +602,13 @@ pub const SymmetricState = struct {
     }
 
     pub fn split(self: *Self) !struct { CipherState, CipherState } {
-        var out: [MAX_HASH_LEN * 2]u8 = undefined;
-        _ = self.hasher.HKDF(&out, self.ck(), &.{}, 2);
-        var temp_k1: [32]u8 = undefined;
-        var temp_k2: [32]u8 = undefined;
-        @memcpy(&temp_k1, out[0..32]);
-        @memcpy(&temp_k2, out[self.hasher.len .. self.hasher.len + 32]);
+        const keys_data = try self.hasher.HKDF(&self.buffer, self.ck(), &.{}, 2);
+        var keys = std.Io.Reader.fixed(keys_data);
+
+        const temp_k1: [32]u8 = (try keys.takeArray(32)).*;
+        keys.seek = self.hasher.len;
+
+        const temp_k2: [32]u8 = (try keys.takeArray(32)).*;
 
         const c1 = try CipherState.init(self.cipher_choice, temp_k1);
         const c2 = try CipherState.init(self.cipher_choice, temp_k2);
