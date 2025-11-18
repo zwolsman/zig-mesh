@@ -3,6 +3,7 @@ const std = @import("std");
 const zio = @import("zio");
 
 const Packet = @import("./packet.zig");
+const noise = @import("noise.zig");
 
 const ID = struct {
     public_key: [32]u8,
@@ -126,9 +127,12 @@ pub const Node = struct {
     }
 
     fn acceptPeer(self: *Self, rt: *zio.Runtime, stream: zio.net.Stream, role: HandshakeRole) !*Peer {
-        const peerId = try Peer.handshake(rt, stream, self.id, role);
+        const handshake = try Peer.handshake(self.allocator, rt, stream, self.kp, role);
 
-        const peer = Peer.init(try self.allocator.create(Peer), rt, stream, peerId);
+        const peer = Peer.init(try self.allocator.create(Peer), rt, stream, .{
+            .public_key = handshake.public_key,
+            .address = handshake.address,
+        });
         log.debug("Peer handshake: {f} (ok)", .{peer.id});
 
         var peer_job = try rt.spawn(peerLoop, .{ self, rt, peer }, .{});
@@ -239,54 +243,98 @@ pub const Peer = struct {
         return peer;
     }
 
-    fn handshake(rt: *zio.Runtime, stream: zio.net.Stream, id: ID, role: HandshakeRole) !ID {
-        var read_buffer: [1024]u8 = undefined;
+    const NOISE_PROTOCOL_NAME = "Noise_XX_25519_ChaChaPoly_SHA256";
+
+    fn handshake(allocator: std.mem.Allocator, rt: *zio.Runtime, stream: zio.net.Stream, kp: std.crypto.sign.Ed25519.KeyPair, role: HandshakeRole) !struct {
+        public_key: [32]u8,
+        address: zio.net.Address,
+        send: noise.CipherState,
+        recv: noise.CipherState,
+    } {
+        var read_buffer: [512]u8 = undefined;
         var reader = stream.reader(rt, &read_buffer);
 
-        var write_buffer: [1024]u8 = undefined;
+        var write_buffer: [512]u8 = undefined;
         var writer = stream.writer(rt, &write_buffer);
 
-        switch (role) {
-            .initiator => {
-                try writer.interface.print("hey!\n", .{});
-                try writer.interface.flush();
+        log.debug("starting handshake ({s} - {})", .{ NOISE_PROTOCOL_NAME, role });
 
-                const line = try reader.interface.takeDelimiterExclusive('\n');
-                if (!std.mem.eql(u8, line, "hello!")) {
-                    log.debug("Handshake failed, disconnecting", .{});
-                    return Error.HandshakeFailed;
-                }
+        if (role == .initiator) {
+            var state = try noise.HandshakeState.init(allocator, NOISE_PROTOCOL_NAME, .initiator, null, null, .{
+                .s = .generate(),
+            });
+            defer state.deinit();
 
-                try writer.interface.writeAll(&id.public_key);
-                try writer.interface.flush();
+            // Stage 1
+            _ = try state.write(&writer.interface, &.{});
+            try writer.interface.flush();
+            log.debug("Stage 1 (ok)", .{});
 
-                const peer_pubkey = try reader.interface.takeArray(32);
+            // Stage 2
+            const remote_payload, _ = try state.read(&reader.interface);
 
-                return .{
-                    .public_key = peer_pubkey.*,
-                    .address = stream.socket.address,
-                };
-            },
-            .responder => {
-                const line = try reader.interface.takeDelimiterExclusive('\n');
-                if (!std.mem.eql(u8, line, "hey!")) {
-                    log.debug("Handshake failed, disconnecting", .{});
-                    return Error.HandshakeFailed;
-                }
+            const raw_pub = remote_payload[0..std.crypto.sign.Ed25519.PublicKey.encoded_length];
+            const remote_pub = try std.crypto.sign.Ed25519.PublicKey.fromBytes(raw_pub.*);
+            const raw_sig = remote_payload[std.crypto.sign.Ed25519.PublicKey.encoded_length .. std.crypto.sign.Ed25519.PublicKey.encoded_length + std.crypto.sign.Ed25519.Signature.encoded_length];
+            const remote_sig = std.crypto.sign.Ed25519.Signature.fromBytes(raw_sig.*);
+            try remote_sig.verify(&remote_pub.bytes, remote_pub);
 
-                try writer.interface.print("hello!\n", .{});
-                try writer.interface.flush();
+            log.debug("Stage 2 pub: {x}..{x}, sig: {x}..{x} (ok)", .{ raw_pub[0..8], raw_pub[raw_pub.len - 8 ..], raw_sig[0..8], raw_sig[raw_sig.len - 8 ..] });
 
-                const peer_pubkey = try reader.interface.takeArray(32);
+            // Stage 3
+            const payload = kp.public_key.bytes ++ (try kp.sign(&kp.public_key.bytes, null)).toBytes();
+            const chains = try state.write(&writer.interface, &payload);
+            if (chains == null) {
+                return error.HandshakeFailed;
+            }
+            try writer.interface.flush();
 
-                try writer.interface.writeAll(&id.public_key);
-                try writer.interface.flush();
+            log.debug("Stage 3 payload: {x}..{x} (ok)", .{ payload[0..8], payload[payload.len - 8 ..] });
+            log.debug("handshake hash: {x}", .{state.handshakeHash()});
 
-                return .{
-                    .public_key = peer_pubkey.*,
-                    .address = stream.socket.address,
-                };
-            },
+            return .{
+                .public_key = remote_pub.bytes,
+                .address = stream.socket.address,
+                .send = chains.?[0],
+                .recv = chains.?[1],
+            };
+        } else {
+            var state = try noise.HandshakeState.init(allocator, NOISE_PROTOCOL_NAME, .responder, null, null, .{
+                .s = .generate(),
+            });
+            defer state.deinit();
+
+            // Stage 1
+            _ = try state.read(&reader.interface);
+            log.debug("Stage 1 (ok)", .{});
+
+            // Stage 2
+            const payload: [96]u8 = kp.public_key.bytes ++ (try kp.sign(&kp.public_key.bytes, null)).toBytes();
+            _ = try state.write(&writer.interface, &payload);
+            try writer.interface.flush();
+            log.debug("Stage 2 payload: {x}..{x} (ok)", .{ payload[0..8], payload[payload.len - 8 ..] });
+
+            // Stage 3
+            const remote_payload, const chains = try state.read(&reader.interface);
+            if (chains == null) {
+                return error.InvalidHandshakeState;
+            }
+
+            const raw_pub = remote_payload[0..std.crypto.sign.Ed25519.PublicKey.encoded_length];
+            const remote_pub = try std.crypto.sign.Ed25519.PublicKey.fromBytes(raw_pub.*);
+            const raw_sig = remote_payload[std.crypto.sign.Ed25519.PublicKey.encoded_length .. std.crypto.sign.Ed25519.PublicKey.encoded_length + std.crypto.sign.Ed25519.Signature.encoded_length];
+            const remote_sig = std.crypto.sign.Ed25519.Signature.fromBytes(raw_sig.*);
+            try remote_sig.verify(&remote_pub.bytes, remote_pub);
+
+            log.debug("Stage 3 pub: {x}..{x}, sig: {x}..{x} (ok)", .{ raw_pub[0..8], raw_pub[raw_pub.len - 8 ..], raw_sig[0..8], raw_sig[raw_sig.len - 8 ..] });
+            log.debug("handshake hash: {x}", .{state.handshakeHash()});
+
+            return .{
+                .public_key = remote_pub.bytes,
+                .address = stream.socket.address,
+                .send = chains.?[1],
+                .recv = chains.?[0],
+            };
         }
     }
 
