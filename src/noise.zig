@@ -6,9 +6,23 @@ const builtin = @import("builtin");
 ///See: http://www.noiseprotocol.org/noise.html#message-format
 pub const MAX_MESSAGE_LEN = 65535;
 
+/// Noise provides a pre-shared symmetric key or PSK mode to support protocols where both parties have a 32-byte shared secret key.
+const PSK_SIZE = 32;
+
+/// The maximum `HASHLEN` that Noise hash functions output.
+pub const MAX_HASH_LEN = 64;
+
 const Role = enum { initiator, responder };
 
-pub const MessageToken = enum {
+const ChaCha20Poly1305CipherState = CipherState_(std.crypto.aead.chacha_poly.ChaCha20Poly1305);
+const Aes256GcmCipherState = CipherState_(std.crypto.aead.aes_gcm.Aes256Gcm);
+
+const Sha256Hash = Hash(std.crypto.hash.sha2.Sha256);
+const Sha512Hash = Hash(std.crypto.hash.sha2.Sha512);
+const Blake2sHash = Hash(std.crypto.hash.blake2.Blake2s256);
+const Blake2bHash = Hash(std.crypto.hash.blake2.Blake2b512);
+
+const MessageToken = enum {
     e,
     s,
     ee,
@@ -27,7 +41,7 @@ const PreMessagePattern = enum {
 
 /// The following handshake patterns represent interactive protocols. These 12 patterns are called the fundamental interactive handshake patterns.
 // The fundamental interactive patterns are named with two characters, which indicate the status of the initiator and responder's static keys. The first and second characters refer to the initiator's and responder's static key respectively.
-pub const HandshakePatternName = enum {
+const HandshakePatternName = enum {
     /// N = **N**o static key for recipient
     N,
     /// K = Static key for sender **K**nown to recipient
@@ -109,7 +123,7 @@ pub const HandshakePatternName = enum {
 /// for `std.meta.stringToEnum` to work as intended.
 ///
 /// [protocol specification]: https://noiseprotocol.org/noise.html#protocol-names-and-modifiers
-pub const CipherChoice = enum {
+const CipherChoice = enum {
     ChaChaPoly,
     AESGCM,
 };
@@ -117,14 +131,14 @@ pub const CipherChoice = enum {
 /// for `std.meta.stringToEnum` to work as intended.
 ///
 /// [protocl specification] http://www.noiseprotocol.org/noise.html#hash-functions
-pub const HashChoice = enum {
+const HashChoice = enum {
     SHA256,
     SHA512,
     BLAKE2s,
     BLAKE2b,
 };
 
-pub const MessagePatternArray = struct {
+const MessagePatternArray = struct {
     buffer: []MessageToken,
     pattern_lens: []usize,
     pattern_index: usize = 0,
@@ -176,16 +190,16 @@ pub const MessagePatternArray = struct {
     }
 };
 
-pub const CipherState = union(enum) {
-    chacha: cipherState(std.crypto.aead.chacha_poly.ChaCha20Poly1305),
-    aesgcm: cipherState(std.crypto.aead.aes_gcm.Aes256Gcm),
+const CipherState = union(enum) {
+    chacha: ChaCha20Poly1305CipherState,
+    aesgcm: Aes256GcmCipherState,
 
     const nonce_length = 12;
 
     pub fn init(cipher_choice: CipherChoice, key: [32]u8) !CipherState {
         return switch (cipher_choice) {
-            .ChaChaPoly => CipherState{ .chacha = cipherState(std.crypto.aead.chacha_poly.ChaCha20Poly1305).init(key) },
-            .AESGCM => CipherState{ .aesgcm = cipherState(std.crypto.aead.aes_gcm.Aes256Gcm).init(key) },
+            .ChaChaPoly => CipherState{ .chacha = .init(key) },
+            .AESGCM => CipherState{ .aesgcm = .init(key) },
         };
     }
 
@@ -196,14 +210,12 @@ pub const CipherState = union(enum) {
             .chacha => {
                 const n_bytes: [8]u8 = @bitCast(std.mem.nativeToLittle(u64, self.chacha.n));
                 @memcpy(nonce[nonce_length - @sizeOf(@TypeOf(self.aesgcm.n)) .. nonce_length], &n_bytes);
-                // std.log.debug("enc nonce: {any} ({x})", .{ nonce, nonce });
 
                 return self.chacha.encryptWithAd(ciphertext, ad, plaintext, nonce);
             },
             .aesgcm => {
                 const n_bytes: [8]u8 = @bitCast(std.mem.nativeToBig(u64, self.aesgcm.n));
                 @memcpy(nonce[nonce_length - @sizeOf(@TypeOf(self.aesgcm.n)) .. nonce_length], &n_bytes);
-                // std.log.debug("enc nonce: {any} ({x})", .{ nonce, nonce });
 
                 return self.aesgcm.encryptWithAd(ciphertext, ad, plaintext, nonce);
             },
@@ -217,14 +229,12 @@ pub const CipherState = union(enum) {
             .chacha => {
                 const n_bytes: [8]u8 = @bitCast(self.chacha.n);
                 @memcpy(nonce[nonce_length - @sizeOf(@TypeOf(self.aesgcm.n)) .. nonce_length], &n_bytes);
-                // std.log.debug("dec nonce: {any} ({x})", .{ nonce, nonce });
 
                 return self.chacha.decryptWithAd(plaintext, ad, ciphertext, nonce);
             },
             .aesgcm => {
                 const n_bytes: [8]u8 = @bitCast(std.mem.nativeToBig(u64, self.aesgcm.n));
                 @memcpy(nonce[nonce_length - @sizeOf(@TypeOf(self.aesgcm.n)) .. nonce_length], &n_bytes);
-                // std.log.debug("dec nonce: {any} ({x})", .{ nonce, nonce });
 
                 return self.aesgcm.decryptWithAd(plaintext, ad, ciphertext, nonce);
             },
@@ -247,7 +257,7 @@ pub const CipherState = union(enum) {
     }
 };
 
-fn cipherState(comptime C: type) type {
+fn CipherState_(comptime C: type) type {
     const cipher = Cipher(C);
 
     return struct {
@@ -481,7 +491,7 @@ test "rekey" {
 
 test "cipherState - encrypt aes" {
     const key: [std.crypto.aead.aes_gcm.Aes256Gcm.key_length]u8 = [_]u8{0x69} ** std.crypto.aead.aes_gcm.Aes256Gcm.key_length;
-    var s = cipherState(std.crypto.aead.aes_gcm.Aes256Gcm).init(key);
+    var s = CipherState_(std.crypto.aead.aes_gcm.Aes256Gcm).init(key);
     const nonce: [std.crypto.aead.aes_gcm.Aes256Gcm.nonce_length]u8 = [_]u8{0x42} ** std.crypto.aead.aes_gcm.Aes256Gcm.nonce_length;
     const m = "Test with message";
     const ad = "Test with associated data";
@@ -534,12 +544,11 @@ pub const SymmetricState = struct {
     _h: [MAX_HASH_LEN]u8,
     _ck: [MAX_HASH_LEN]u8,
     buffer: [MAX_MESSAGE_LEN]u8,
-    writer: std.Io.Writer,
     cipher_state: CipherState,
     cipher_choice: CipherChoice,
     hasher: Hasher,
 
-    pub fn init(self: *Self, protocol_name: []const u8) !void {
+    pub fn init(protocol_name: []const u8) !SymmetricState {
         const protocol = protocolFromName(protocol_name);
         const hash_len: usize = switch (protocol.hash) {
             .SHA256, .BLAKE2s => 32,
@@ -565,11 +574,10 @@ pub const SymmetricState = struct {
             _ = try hasher.hash(h_buf[0..hash_len], protocol_name);
         }
 
-        self.* = .{
+        return .{
             ._h = h_buf,
             ._ck = h_buf,
             .buffer = undefined,
-            .writer = .fixed(&self.buffer),
             .cipher_state = try .init(protocol.cipher, [_]u8{0} ** 32),
             .cipher_choice = protocol.cipher,
             .hasher = hasher,
@@ -583,22 +591,22 @@ pub const SymmetricState = struct {
         pub fn hash(self: *Hasher, output: []u8, input: []const u8) ![]u8 {
             switch (self.choice) {
                 .SHA256 => {
-                    const result = Sha256.hash(input);
+                    const result = Sha256Hash.hash(input);
                     @memcpy(output[0..result.len], &result);
                     return output[0..result.len];
                 },
                 .BLAKE2b => {
-                    const result = Blake2b.hash(input);
+                    const result = Blake2bHash.hash(input);
                     @memcpy(output[0..result.len], &result);
                     return output[0..result.len];
                 },
                 .SHA512 => {
-                    const result = Sha512.hash(input);
+                    const result = Sha512Hash.hash(input);
                     @memcpy(output[0..result.len], &result);
                     return output[0..result.len];
                 },
                 .BLAKE2s => {
-                    const result = Blake2s.hash(input);
+                    const result = Blake2sHash.hash(input);
                     @memcpy(output[0..result.len], &result);
                     return output[0..result.len];
                 },
@@ -619,8 +627,8 @@ pub const SymmetricState = struct {
             var w = std.Io.Writer.fixed(output);
             if (self.choice == .SHA256 or self.choice == .BLAKE2s) {
                 const result = switch (self.choice) {
-                    .SHA256 => Sha256.HKDF(chaining_key, input_key_material, num_outputs),
-                    .BLAKE2s => Blake2s.HKDF(chaining_key, input_key_material, num_outputs),
+                    .SHA256 => Sha256Hash.HKDF(chaining_key, input_key_material, num_outputs),
+                    .BLAKE2s => Blake2sHash.HKDF(chaining_key, input_key_material, num_outputs),
                     else => unreachable,
                 };
 
@@ -633,9 +641,9 @@ pub const SymmetricState = struct {
             }
             if (self.choice == .SHA512 or self.choice == .BLAKE2b) {
                 const result = switch (self.choice) {
-                    .SHA512 => Sha512.HKDF(chaining_key, input_key_material, num_outputs),
+                    .SHA512 => Sha512Hash.HKDF(chaining_key, input_key_material, num_outputs),
 
-                    .BLAKE2b => Blake2b.HKDF(chaining_key, input_key_material, num_outputs),
+                    .BLAKE2b => Blake2bHash.HKDF(chaining_key, input_key_material, num_outputs),
                     else => unreachable,
                 };
                 try w.writeAll(&result.@"0");
@@ -662,12 +670,11 @@ pub const SymmetricState = struct {
     }
 
     pub fn mixHash(self: *Self, data: []const u8) !void {
-        try self.writer.writeAll(self.h());
-        try self.writer.writeAll(data);
+        var w = std.Io.Writer.fixed(&self.buffer);
+        try w.writeAll(self.h());
+        try w.writeAll(data);
 
-        _ = try self.hasher.hash(&self._h, self.writer.buffered());
-
-        _ = self.writer.consumeAll();
+        _ = try self.hasher.hash(&self._h, w.buffered());
     }
 
     pub fn mixKeyAndHash(self: *Self, input_key_material: []const u8) !void {
@@ -723,20 +730,12 @@ pub const SymmetricState = struct {
     }
 };
 
-const Sha256 = Hash(std.crypto.hash.sha2.Sha256);
-const Sha512 = Hash(std.crypto.hash.sha2.Sha512);
-const Blake2s = Hash(std.crypto.hash.blake2.Blake2s256);
-const Blake2b = Hash(std.crypto.hash.blake2.Blake2b512);
-
-/// The maximum `HASHLEN` that Noise hash functions output.
-pub const MAX_HASH_LEN = 64;
-
 /// Instantiates a Noise hash function.
 ///
 /// Only these hash functions are supported in accordance with the spec: `Sha256`, `Sha512`, `Blake2s256`, `Blake2b512`.
 ///
 /// See: https://noiseprotocol.org/noise.html#hash-functions
-pub fn Hash(comptime H: type) type {
+fn Hash(comptime H: type) type {
     const HASHLEN = comptime switch (H) {
         std.crypto.hash.sha2.Sha256, std.crypto.hash.blake2.Blake2s256 => 32,
         std.crypto.hash.sha2.Sha512, std.crypto.hash.blake2.Blake2b512 => MAX_HASH_LEN,
@@ -802,7 +801,7 @@ pub fn Hash(comptime H: type) type {
     };
 }
 
-const HandshakeState = struct {
+pub const HandshakeState = struct {
     allocator: std.mem.Allocator,
     role: Role,
 
@@ -825,7 +824,7 @@ const HandshakeState = struct {
     psks: ?[]const u8,
 
     handshake_pattern: HandshakePattern,
-    symmetric_state: *SymmetricState,
+    symmetric_state: SymmetricState,
 
     const Keys = struct {
         /// The local static key pair
@@ -1124,8 +1123,7 @@ const HandshakeState = struct {
 
     pub fn init(allocator: std.mem.Allocator, protocol_name: []const u8, role: Role, prologue: []const u8, psks: ?[]const u8, keys: Keys) !HandshakeState {
         const protocol = protocolFromName(protocol_name);
-        var symmetric_state = try allocator.create(SymmetricState);
-        try symmetric_state.init(protocol_name);
+        var symmetric_state = try SymmetricState.init(protocol_name);
         try symmetric_state.mixHash(prologue);
 
         const pattern = try HandshakePattern.init(allocator, protocol.pattern);
@@ -1180,7 +1178,6 @@ const HandshakeState = struct {
 
     pub fn deinit(self: *HandshakeState) void {
         self.handshake_pattern.deinit(self.allocator);
-        self.allocator.destroy(self.symmetric_state);
         if (self.psks) |psks| self.allocator.free(psks);
     }
 
@@ -1313,9 +1310,6 @@ const HandshakeState = struct {
         return self.symmetric_state.h();
     }
 
-    //Noise provides a pre-shared symmetric key or PSK mode to support protocols where both parties have a 32-byte shared secret key.
-    const PSK_SIZE = 32;
-
     /// Take a pre-shared key (psk) and increment the psk idx
     fn psk(self: *HandshakeState) []const u8 {
         const key = self.psks.?[self.psk_idx * PSK_SIZE .. (self.psk_idx + 1) * PSK_SIZE];
@@ -1352,28 +1346,30 @@ const Vector = struct {
     messages: []const Message,
 };
 
-/// Constructs a `Protocol` from a `protocol_name` byte sequence.
-///
-/// This `Protocol` will be used to instantiate a `SymmetricState`.
-fn protocolFromName(protocol_name: []const u8) struct {
+const Protocol = struct {
     pattern: []const u8,
     dh: []const u8,
     cipher: CipherChoice,
     hash: HashChoice,
-} {
+};
+
+/// Constructs a `Protocol` from a `protocol_name` byte sequence.
+///
+/// This `Protocol` will be used to instantiate a `SymmetricState`.
+fn protocolFromName(protocol_name: []const u8) Protocol {
     var split_it = std.mem.splitScalar(u8, protocol_name, '_');
     _ = split_it.next().?;
     const pattern = split_it.next().?;
     const dh = split_it.next().?;
-    const cipher_ = std.meta.stringToEnum(CipherChoice, split_it.next().?).?;
-    const hash_ = std.meta.stringToEnum(HashChoice, split_it.next().?).?;
+    const cipher = std.meta.stringToEnum(CipherChoice, split_it.next().?).?;
+    const hash = std.meta.stringToEnum(HashChoice, split_it.next().?).?;
     std.debug.assert(split_it.next() == null);
 
     return .{
         .pattern = pattern,
         .dh = dh,
-        .cipher = cipher_,
-        .hash = hash_,
+        .cipher = cipher,
+        .hash = hash,
     };
 }
 
