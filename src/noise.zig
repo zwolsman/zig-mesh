@@ -1105,9 +1105,46 @@ const HandshakeState = struct {
         try symmetric_state.init(protocol_name);
         try symmetric_state.mixHash(prologue);
 
+        const pattern = try HandshakePattern.init(allocator, protocol.pattern);
+
+        // Rules for hashing pre-messages:
+        // 1) Initiator's public keys are always hashed first.
+        // 2) If multiple public keys are listed, they are hashed in the order that they are listed.
+        if (role == .initiator) {
+            if (pattern.pre_message_pattern_initiator) |i| {
+                switch (i) {
+                    .s => if (keys.s) |s| try symmetric_state.mixHash(&s.public_key),
+                    .e => if (keys.e) |e| try symmetric_state.mixHash(&e.public_key),
+                    else => return error.InvalidPreMessagePattern,
+                }
+            }
+            if (pattern.pre_message_pattern_responder) |r| {
+                switch (r) {
+                    .s => if (keys.rs) |rs| try symmetric_state.mixHash(&rs),
+                    .e => if (keys.re) |re| try symmetric_state.mixHash(&re),
+                    else => return error.InvalidPreMessagePattern,
+                }
+            }
+        } else {
+            if (pattern.pre_message_pattern_initiator) |i| {
+                switch (i) {
+                    .s => if (keys.rs) |rs| try symmetric_state.mixHash(&rs),
+                    .e => if (keys.re) |re| try symmetric_state.mixHash(&re),
+                    else => return error.InvalidPreMessagePattern,
+                }
+            }
+            if (pattern.pre_message_pattern_responder) |r| {
+                switch (r) {
+                    .s => if (keys.s) |s| try symmetric_state.mixHash(&s.public_key),
+                    .e => if (keys.e) |e| try symmetric_state.mixHash(&e.public_key),
+                    else => return error.InvalidPreMessagePattern,
+                }
+            }
+        }
+
         return .{
             .allocator = allocator,
-            .handshake_pattern = try .init(allocator, protocol.pattern),
+            .handshake_pattern = pattern,
             .symmetric_state = symmetric_state,
             .s = keys.s,
             .e = keys.e,
@@ -1416,14 +1453,6 @@ test "cacophony" {
             continue;
         }
 
-        if (!std.mem.eql(u8, protocol.pattern, "XX")) {
-            ignored_vector_count += 1;
-            continue;
-        }
-        // if (protocol.cipher != .AESGCM) continue;
-
-        // if (protocol.hash != .SHA256) continue;
-
         std.debug.print("\n***** Testing: {s} *****\n", .{vector.protocol_name});
         const init_s = if (vector.init_static) |s| try keypairFromSecretKey(s) else null;
         const init_e = try keypairFromSecretKey(vector.init_ephemeral);
@@ -1440,7 +1469,8 @@ test "cacophony" {
         const init_psks = blk: {
             if (vector.init_psks) |psks| {
                 var init_psk_buf = try allocator.alloc(u8, 32 * psks.len);
-                errdefer allocator.free(init_psk_buf);
+                // errdefer allocator.free(init_psk_buf); TODO: fix
+                defer allocator.free(init_psk_buf);
                 for (psks) |psk| {
                     _ = try std.fmt.hexToBytes(init_psk_buf[j * 32 .. (j + 1) * 32], psk);
                     j += 1;
@@ -1480,7 +1510,8 @@ test "cacophony" {
         const resp_psks = blk: {
             if (vector.resp_psks) |psks| {
                 var resp_psk_buf = try allocator.alloc(u8, 32 * psks.len);
-                errdefer allocator.free(resp_psk_buf);
+                // errdefer allocator.free(resp_psk_buf); TODO: fix
+                defer allocator.free(resp_psk_buf);
                 for (psks) |psk| {
                     _ = try std.fmt.hexToBytes(resp_psk_buf[j * 32 .. (j + 1) * 32], psk);
                     j += 1;
@@ -1572,7 +1603,7 @@ test "cacophony" {
                 }
                 break :handshake_phase;
             }
-            std.debug.print("Vector \"{s}\" ({}) message {} OK\n", .{ vector.protocol_name, vector_num + 1, k });
+            // std.debug.print("Vector \"{s}\" ({}) message {} OK\n", .{ vector.protocol_name, vector_num + 1, k });
         }
 
         try std.testing.expectEqualSlices(u8, initiator.handshakeHash(), responder.handshakeHash());
@@ -1581,6 +1612,7 @@ test "cacophony" {
             p.isOneWay()
         else
             false;
+
         // Transport phase
         for (msg_idx..vector.messages.len) |k| {
             const m = vector.messages[k];
@@ -1623,8 +1655,8 @@ test "cacophony" {
                 std.debug.print("Vector \"{s}\" ({}) failed after decryptWithAd\n", .{ vector.protocol_name, vector_num + 1 });
                 continue :vector_test;
             };
-            std.debug.print("Vector \"{s}\" ({}) message {} OK\n", .{ vector.protocol_name, vector_num + 1, k });
+            // std.debug.print("Vector \"{s}\" ({}) message {} OK\n", .{ vector.protocol_name, vector_num + 1, k });
         }
     }
-    std.debug.print("***** {} out of {} vectors passed ({} ignored). *****\n", .{ total_vector_count - failed_vector_count - ignored_vector_count, total_vector_count, ignored_vector_count });
+    std.debug.print("***** {} out of {} vectors passed ({} ignored, {} failed). *****\n", .{ total_vector_count - failed_vector_count - ignored_vector_count, total_vector_count, ignored_vector_count, failed_vector_count });
 }
