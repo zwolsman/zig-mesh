@@ -190,13 +190,13 @@ const MessagePatternArray = struct {
     }
 };
 
-const CipherState = union(enum) {
+pub const CipherState = union(enum) {
     chacha: ChaCha20Poly1305CipherState,
     aesgcm: Aes256GcmCipherState,
 
     const nonce_length = 12;
 
-    pub fn init(cipher_choice: CipherChoice, key: [32]u8) !CipherState {
+    pub fn init(cipher_choice: CipherChoice, key: [32]u8) CipherState {
         return switch (cipher_choice) {
             .ChaChaPoly => CipherState{ .chacha = .init(key) },
             .AESGCM => CipherState{ .aesgcm = .init(key) },
@@ -543,12 +543,13 @@ pub const SymmetricState = struct {
 
     _h: [MAX_HASH_LEN]u8,
     _ck: [MAX_HASH_LEN]u8,
-    buffer: [MAX_MESSAGE_LEN]u8,
+    buffer: []u8,
+    allocator: std.mem.Allocator,
     cipher_state: CipherState,
     cipher_choice: CipherChoice,
     hasher: Hasher,
 
-    pub fn init(protocol_name: []const u8) !SymmetricState {
+    pub fn init(allocator: std.mem.Allocator, protocol_name: []const u8) !SymmetricState {
         const protocol = protocolFromName(protocol_name);
         const hash_len: usize = switch (protocol.hash) {
             .SHA256, .BLAKE2s => 32,
@@ -577,11 +578,16 @@ pub const SymmetricState = struct {
         return .{
             ._h = h_buf,
             ._ck = h_buf,
-            .buffer = undefined,
-            .cipher_state = try .init(protocol.cipher, [_]u8{0} ** 32),
+            .buffer = try allocator.alloc(u8, MAX_MESSAGE_LEN),
+            .cipher_state = .init(protocol.cipher, [_]u8{0} ** 32),
             .cipher_choice = protocol.cipher,
             .hasher = hasher,
+            .allocator = allocator,
         };
+    }
+
+    pub fn deinit(self: *Self) void {
+        self.allocator.free(self.buffer);
     }
 
     const Hasher = struct {
@@ -659,18 +665,18 @@ pub const SymmetricState = struct {
     };
 
     pub fn mixKey(self: *Self, input_key_material: []const u8) !void {
-        const keys_data = try self.hasher.HKDF(&self.buffer, self.ck(), input_key_material, 2);
+        const keys_data = try self.hasher.HKDF(self.buffer, self.ck(), input_key_material, 2);
         var keys = std.Io.Reader.fixed(keys_data);
 
         @memcpy(self._ck[0..self.hasher.len], try keys.take(self.hasher.len));
 
         // If HASHLEN is 64, then truncates temp_k to 32 bytes.
         const temp_k: [32]u8 = (try keys.takeArray(32)).*;
-        self.cipher_state = try .init(self.cipher_choice, temp_k);
+        self.cipher_state = .init(self.cipher_choice, temp_k);
     }
 
     pub fn mixHash(self: *Self, data: []const u8) !void {
-        var w = std.Io.Writer.fixed(&self.buffer);
+        var w = std.Io.Writer.fixed(self.buffer);
         try w.writeAll(self.h());
         try w.writeAll(data);
 
@@ -687,7 +693,7 @@ pub const SymmetricState = struct {
 
         // If HASHLEN is 64, then truncates temp_k to 32 bytes.
         const temp_k: [32]u8 = (try keys.takeArray(32)).*;
-        self.cipher_state = try .init(self.cipher_choice, temp_k);
+        self.cipher_state = .init(self.cipher_choice, temp_k);
     }
 
     /// Sets ciphertext = EncryptWithAd(h, plaintext), calls MixHash(ciphertext), and returns ciphertext.
@@ -707,7 +713,7 @@ pub const SymmetricState = struct {
     }
 
     pub fn split(self: *Self) !struct { CipherState, CipherState } {
-        const keys_data = try self.hasher.HKDF(&self.buffer, self.ck(), &.{}, 2);
+        const keys_data = try self.hasher.HKDF(self.buffer, self.ck(), &.{}, 2);
         var keys = std.Io.Reader.fixed(keys_data);
 
         const temp_k1: [32]u8 = (try keys.takeArray(32)).*;
@@ -715,8 +721,8 @@ pub const SymmetricState = struct {
 
         const temp_k2: [32]u8 = (try keys.takeArray(32)).*;
 
-        const c1 = try CipherState.init(self.cipher_choice, temp_k1);
-        const c2 = try CipherState.init(self.cipher_choice, temp_k2);
+        const c1: CipherState = .init(self.cipher_choice, temp_k1);
+        const c2: CipherState = .init(self.cipher_choice, temp_k2);
 
         return .{ c1, c2 };
     }
@@ -846,6 +852,7 @@ pub const HandshakeState = struct {
         pre_message_pattern_initiator: ?PreMessagePattern = null,
         pre_message_pattern_responder: ?PreMessagePattern = null,
         message_patterns: MessagePatternArray,
+        allocator: std.mem.Allocator,
 
         pub fn init(allocator: std.mem.Allocator, hs_pattern_name: []const u8) !HandshakePattern {
             var hs_pattern_name_enum = std.meta.stringToEnum(HandshakePatternName, hs_pattern_name);
@@ -869,7 +876,10 @@ pub const HandshakeState = struct {
             }
 
             if (hs_pattern_name_enum == null) return error.UnrecognizedName;
-            var handshake_pattern: HandshakePattern = .{ .message_patterns = undefined };
+            var handshake_pattern: HandshakePattern = .{
+                .message_patterns = undefined,
+                .allocator = allocator,
+            };
 
             var message_patterns: MessagePatterns = .init(allocator);
             defer {
@@ -1091,7 +1101,6 @@ pub const HandshakeState = struct {
                 },
             }
 
-            // TODO: add psk support
             while (modifier_it.next()) |m| {
                 if (std.mem.containsAtLeast(u8, m, 1, "psk")) {
                     const num = try std.fmt.parseInt(usize, m["psk".len .. "psk".len + 1], 10);
@@ -1110,8 +1119,8 @@ pub const HandshakeState = struct {
             return handshake_pattern;
         }
 
-        pub fn deinit(self: *HandshakePattern, allocator: std.mem.Allocator) void {
-            self.message_patterns.deinit(allocator);
+        pub fn deinit(self: *HandshakePattern) void {
+            self.message_patterns.deinit(self.allocator);
         }
 
         fn create_pattern(a: std.mem.Allocator, tokens: []const MessageToken) !std.array_list.Managed(MessageToken) {
@@ -1121,12 +1130,15 @@ pub const HandshakeState = struct {
         }
     };
 
-    pub fn init(allocator: std.mem.Allocator, protocol_name: []const u8, role: Role, prologue: []const u8, psks: ?[]const u8, keys: Keys) !HandshakeState {
+    pub fn init(allocator: std.mem.Allocator, protocol_name: []const u8, role: Role, prologue: ?[]const u8, psks: ?[]const u8, keys: Keys) !HandshakeState {
         const protocol = protocolFromName(protocol_name);
-        var symmetric_state = try SymmetricState.init(protocol_name);
-        try symmetric_state.mixHash(prologue);
+        var symmetric_state: SymmetricState = try .init(allocator, protocol_name);
 
-        const pattern = try HandshakePattern.init(allocator, protocol.pattern);
+        if (prologue) |p| {
+            try symmetric_state.mixHash(p);
+        }
+
+        const pattern: HandshakePattern = try .init(allocator, protocol.pattern);
 
         // Rules for hashing pre-messages:
         // 1) Initiator's public keys are always hashed first.
@@ -1177,11 +1189,12 @@ pub const HandshakeState = struct {
     }
 
     pub fn deinit(self: *HandshakeState) void {
-        self.handshake_pattern.deinit(self.allocator);
+        self.handshake_pattern.deinit();
+        self.symmetric_state.deinit();
         if (self.psks) |psks| self.allocator.free(psks);
     }
 
-    pub fn write(self: *HandshakeState, writer: *std.Io.Writer, payload: []u8) !?struct { CipherState, CipherState } {
+    pub fn write(self: *HandshakeState, writer: *std.Io.Writer, payload: []const u8) !?struct { CipherState, CipherState } {
         const pattern = self.handshake_pattern.message_patterns.next();
         if (pattern) |p| {
             for (p) |token| {
@@ -1198,7 +1211,7 @@ pub const HandshakeState = struct {
                         if (self.psks) |psks| if (psks.len > 0) try self.symmetric_state.mixKey(&public_key);
                     },
                     .s => {
-                        var cipher_text: [48]u8 = std.mem.zeroes([48]u8); // pub_key + tag len
+                        var cipher_text: [48]u8 = undefined;
                         const key = try self.symmetric_state.encryptAndHash(&cipher_text, &self.s.?.public_key);
 
                         try writer.writeAll(key);
