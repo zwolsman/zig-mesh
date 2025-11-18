@@ -18,6 +18,86 @@ pub const MessageToken = enum {
     psk,
 };
 
+const PreMessagePattern = enum {
+    e,
+    s,
+    es,
+    empty,
+};
+
+/// The following handshake patterns represent interactive protocols. These 12 patterns are called the fundamental interactive handshake patterns.
+// The fundamental interactive patterns are named with two characters, which indicate the status of the initiator and responder's static keys. The first and second characters refer to the initiator's and responder's static key respectively.
+pub const HandshakePatternName = enum {
+    /// N = **N**o static key for recipient
+    N,
+    /// K = Static key for sender **K**nown to recipient
+    K,
+    /// X = Static key for sender **X**mitted (transmitted) to recipient
+    X,
+    /// N = **N**o static key for initiator
+    /// N = **N**o static key for responder
+    NN,
+    /// N = **N**o static key for initiator
+    /// K = Static key for responder **K**nown to initiator
+    NK,
+    /// N = **N**o static key for initiator
+    /// K = Static key for responder **K**nown to initiator
+    NK1,
+    NX1,
+    /// N = **N**o static key for initiator
+    /// X = Static key for responder **X**mitted (transmitted) to initiator
+    NX,
+    /// K = Static key for initiator **K**nown to responder
+    /// N = **N**o static key for responder
+    KN,
+    /// K = Static key for initiator **K**nown to responder
+    /// K = Static key for responder **K**nown to initiator
+    KK,
+    /// K = Static key for initiator **K**nown to responder
+    /// X = Static key for responder **X**mitted (transmitted) to initiator
+    KX,
+    K1N,
+    K1K,
+    KK1,
+    K1K1,
+    K1X,
+    KX1,
+    K1X1,
+    /// X = Static key for initiator **X**mitted (transmitted) to responder
+    /// N = **N**o static key for responder
+    XN,
+    X1N,
+    /// X = Static key for initiator **X**mitted (transmitted) to responder
+    /// K = Static key for responder **K**nown to initiator
+    XK,
+    X1K,
+    XK1,
+    X1K1,
+    /// X = Static key for initiator **X**mitted (transmitted) to responder
+    /// X = Static key for responder **X**mitted (transmitted) to initiator
+    XX,
+    X1X,
+    // XX1,
+    XX1,
+    X1X1,
+    /// I = Static key for initiator **I**mmediately transmitted to responder, despite reduced or absent identity hiding
+    /// X = Static key for responder **X**mitted (transmitted) to initiator
+    IN,
+    /// I = Static key for initiator **I**mmediately transmitted to responder, despite reduced or absent identity hiding
+    /// N = **N**o static key for responder
+    IK,
+    /// I = Static key for initiator **I**mmediately transmitted to responder, despite reduced or absent identity hiding
+    /// X = Static key for responder **X**mitted (transmitted) to initiator
+    IX,
+    I1N,
+    I1K,
+    IK1,
+    I1K1,
+    I1X,
+    IX1,
+    I1X1,
+};
+
 /// Choice of cipher in a noise protocol. These must be stylized like in the [protocol specification]
 /// for `std.meta.stringToEnum` to work as intended.
 ///
@@ -489,8 +569,6 @@ pub const SymmetricState = struct {
         };
     }
 
-    pub fn deinit() void {}
-
     const Hasher = struct {
         choice: HashChoice,
         len: usize,
@@ -722,7 +800,7 @@ const HandshakeState = struct {
 
     psks: ?[]const u8,
 
-    message_patterns: MessagePatternArray,
+    handshake_pattern: HandshakePattern,
     symmetric_state: *SymmetricState,
 
     const Keys = struct {
@@ -739,42 +817,290 @@ const HandshakeState = struct {
         re: ?[std.crypto.dh.X25519.public_length]u8 = null,
     };
 
-    const Protocol = enum {
-        XX,
-
+    const HandshakePattern = struct {
         const MessagePatterns = std.array_list.Managed([]MessageToken);
 
-        const UnmanagedTokenArray = std.ArrayList(MessageToken);
+        pre_message_pattern_initiator: ?PreMessagePattern = null,
+        pre_message_pattern_responder: ?PreMessagePattern = null,
+        message_patterns: MessagePatternArray,
 
-        fn messagePatterns(self: Protocol, allocator: std.mem.Allocator) !MessagePatternArray {
-            var message_pattern: MessagePatterns = .init(allocator);
-            defer {
-                for (message_pattern.items) |pattern| {
-                    allocator.free(pattern);
+        pub fn init(allocator: std.mem.Allocator, hs_pattern_name: []const u8) !HandshakePattern {
+            var hs_pattern_name_enum = std.meta.stringToEnum(HandshakePatternName, hs_pattern_name);
+
+            var modifier_it: std.mem.SplitIterator(u8, .any) = undefined;
+
+            // Exhaustively split pattern name string to get a valid pattern name. If none are found,
+            // we return a `HandshakePatternError.UnrecognizedName` error.
+            if (hs_pattern_name_enum == null) {
+                var modifier_str: []const u8 = undefined;
+                for (1..hs_pattern_name.len) |i| {
+                    const pattern = std.meta.stringToEnum(HandshakePatternName, hs_pattern_name[0 .. hs_pattern_name.len - i]);
+
+                    if (pattern) |_| {
+                        modifier_str = hs_pattern_name[hs_pattern_name.len - i .. hs_pattern_name.len];
+                        hs_pattern_name_enum = pattern;
+                        break;
+                    }
                 }
-                message_pattern.deinit();
+                modifier_it = std.mem.splitAny(u8, modifier_str, "+");
             }
 
-            switch (self) {
+            if (hs_pattern_name_enum == null) return error.UnrecognizedName;
+            var handshake_pattern: HandshakePattern = .{ .message_patterns = undefined };
+
+            var message_patterns: MessagePatterns = .init(allocator);
+            defer {
+                for (message_patterns.items) |pattern| {
+                    allocator.free(pattern);
+                }
+                message_patterns.deinit();
+            }
+
+            switch (hs_pattern_name_enum.?) {
+                .N => {
+                    handshake_pattern.pre_message_pattern_responder = .s;
+                    try message_patterns.append(try allocator.dupe(MessageToken, &[_]MessageToken{ .e, .es }));
+                },
+                .NN => {
+                    try message_patterns.append(try allocator.dupe(MessageToken, &[_]MessageToken{.e}));
+                    try message_patterns.append(try allocator.dupe(MessageToken, &[_]MessageToken{ .e, .ee }));
+                },
+                .NK => {
+                    handshake_pattern.pre_message_pattern_responder = .s;
+                    try message_patterns.append(try allocator.dupe(MessageToken, &[_]MessageToken{ .e, .es }));
+                    try message_patterns.append(try allocator.dupe(MessageToken, &[_]MessageToken{ .e, .ee }));
+                },
+                .NK1 => {
+                    handshake_pattern.pre_message_pattern_responder = .s;
+                    try message_patterns.append(try allocator.dupe(MessageToken, &[_]MessageToken{.e}));
+                    try message_patterns.append(try allocator.dupe(MessageToken, &[_]MessageToken{ .e, .ee, .es }));
+                },
+                .NX => {
+                    try message_patterns.append(try allocator.dupe(MessageToken, &[_]MessageToken{.e}));
+                    try message_patterns.append(try allocator.dupe(MessageToken, &[_]MessageToken{ .e, .ee, .s, .es }));
+                },
+                .NX1 => {
+                    try message_patterns.append(try allocator.dupe(MessageToken, &[_]MessageToken{.e}));
+                    try message_patterns.append(try allocator.dupe(MessageToken, &[_]MessageToken{ .e, .ee, .s }));
+                    try message_patterns.append(try allocator.dupe(MessageToken, &[_]MessageToken{.es}));
+                },
+
+                .K => {
+                    handshake_pattern.pre_message_pattern_initiator = .s;
+                    handshake_pattern.pre_message_pattern_responder = .s;
+                    try message_patterns.append(try allocator.dupe(MessageToken, &[_]MessageToken{ .e, .es, .ss }));
+                },
+                .KN => {
+                    handshake_pattern.pre_message_pattern_initiator = .s;
+                    try message_patterns.append(try allocator.dupe(MessageToken, &[_]MessageToken{.e}));
+                    try message_patterns.append(try allocator.dupe(MessageToken, &[_]MessageToken{ .e, .ee, .se }));
+                },
+                .KK => {
+                    handshake_pattern.pre_message_pattern_initiator = .s;
+                    handshake_pattern.pre_message_pattern_responder = .s;
+                    try message_patterns.append(try allocator.dupe(MessageToken, &[_]MessageToken{ .e, .es, .ss }));
+                    try message_patterns.append(try allocator.dupe(MessageToken, &[_]MessageToken{ .e, .ee, .se }));
+                },
+                .KX => {
+                    handshake_pattern.pre_message_pattern_initiator = .s;
+                    try message_patterns.append(try allocator.dupe(MessageToken, &[_]MessageToken{.e}));
+                    try message_patterns.append(try allocator.dupe(MessageToken, &[_]MessageToken{ .e, .ee, .se, .s, .es }));
+                },
+                .K1N => {
+                    handshake_pattern.pre_message_pattern_initiator = .s;
+                    try message_patterns.append(try allocator.dupe(MessageToken, &[_]MessageToken{.e}));
+                    try message_patterns.append(try allocator.dupe(MessageToken, &[_]MessageToken{ .e, .ee }));
+                    try message_patterns.append(try allocator.dupe(MessageToken, &[_]MessageToken{.se}));
+                },
+                .K1K => {
+                    handshake_pattern.pre_message_pattern_initiator = .s;
+                    handshake_pattern.pre_message_pattern_responder = .s;
+                    try message_patterns.append(try allocator.dupe(MessageToken, &[_]MessageToken{ .e, .es }));
+                    try message_patterns.append(try allocator.dupe(MessageToken, &[_]MessageToken{ .e, .ee }));
+                    try message_patterns.append(try allocator.dupe(MessageToken, &[_]MessageToken{.se}));
+                },
+                .KK1 => {
+                    handshake_pattern.pre_message_pattern_initiator = .s;
+                    handshake_pattern.pre_message_pattern_responder = .s;
+                    try message_patterns.append(try allocator.dupe(MessageToken, &[_]MessageToken{.e}));
+                    try message_patterns.append(try allocator.dupe(MessageToken, &[_]MessageToken{ .e, .ee, .se, .es }));
+                },
+                .K1K1 => {
+                    handshake_pattern.pre_message_pattern_initiator = .s;
+                    handshake_pattern.pre_message_pattern_responder = .s;
+                    try message_patterns.append(try allocator.dupe(MessageToken, &[_]MessageToken{.e}));
+                    try message_patterns.append(try allocator.dupe(MessageToken, &[_]MessageToken{ .e, .ee, .es }));
+                    try message_patterns.append(try allocator.dupe(MessageToken, &[_]MessageToken{.se}));
+                },
+                .K1X => {
+                    handshake_pattern.pre_message_pattern_initiator = .s;
+                    try message_patterns.append(try allocator.dupe(MessageToken, &[_]MessageToken{.e}));
+                    try message_patterns.append(try allocator.dupe(MessageToken, &[_]MessageToken{ .e, .ee, .s, .es }));
+                    try message_patterns.append(try allocator.dupe(MessageToken, &[_]MessageToken{.se}));
+                },
+                .KX1 => {
+                    handshake_pattern.pre_message_pattern_initiator = .s;
+                    try message_patterns.append(try allocator.dupe(MessageToken, &[_]MessageToken{.e}));
+                    try message_patterns.append(try allocator.dupe(MessageToken, &[_]MessageToken{ .e, .ee, .se, .s }));
+                    try message_patterns.append(try allocator.dupe(MessageToken, &[_]MessageToken{.es}));
+                },
+                .K1X1 => {
+                    handshake_pattern.pre_message_pattern_initiator = .s;
+                    try message_patterns.append(try allocator.dupe(MessageToken, &[_]MessageToken{.e}));
+                    try message_patterns.append(try allocator.dupe(MessageToken, &[_]MessageToken{ .e, .ee, .s }));
+                    try message_patterns.append(try allocator.dupe(MessageToken, &[_]MessageToken{ .se, .es }));
+                },
+                .X => {
+                    handshake_pattern.pre_message_pattern_responder = .s;
+                    try message_patterns.append(try allocator.dupe(MessageToken, &[_]MessageToken{ .e, .es, .s, .ss }));
+                },
+                .XN => {
+                    try message_patterns.append(try allocator.dupe(MessageToken, &[_]MessageToken{.e}));
+                    try message_patterns.append(try allocator.dupe(MessageToken, &[_]MessageToken{ .e, .ee }));
+                    try message_patterns.append(try allocator.dupe(MessageToken, &[_]MessageToken{ .s, .se }));
+                },
+                .X1N => {
+                    try message_patterns.append(try allocator.dupe(MessageToken, &[_]MessageToken{.e}));
+                    try message_patterns.append(try allocator.dupe(MessageToken, &[_]MessageToken{ .e, .ee }));
+                    try message_patterns.append(try allocator.dupe(MessageToken, &[_]MessageToken{.s}));
+                    try message_patterns.append(try allocator.dupe(MessageToken, &[_]MessageToken{.se}));
+                },
+
+                .XK => {
+                    handshake_pattern.pre_message_pattern_responder = .s;
+                    try message_patterns.append(try allocator.dupe(MessageToken, &[_]MessageToken{ .e, .es }));
+                    try message_patterns.append(try allocator.dupe(MessageToken, &[_]MessageToken{ .e, .ee }));
+                    try message_patterns.append(try allocator.dupe(MessageToken, &[_]MessageToken{ .s, .se }));
+                },
+                .X1K => {
+                    handshake_pattern.pre_message_pattern_responder = .s;
+                    try message_patterns.append(try allocator.dupe(MessageToken, &[_]MessageToken{ .e, .es }));
+                    try message_patterns.append(try allocator.dupe(MessageToken, &[_]MessageToken{ .e, .ee }));
+                    try message_patterns.append(try allocator.dupe(MessageToken, &[_]MessageToken{.s}));
+                    try message_patterns.append(try allocator.dupe(MessageToken, &[_]MessageToken{.se}));
+                },
+                .XK1 => {
+                    handshake_pattern.pre_message_pattern_responder = .s;
+                    try message_patterns.append(try allocator.dupe(MessageToken, &[_]MessageToken{.e}));
+                    try message_patterns.append(try allocator.dupe(MessageToken, &[_]MessageToken{ .e, .ee, .es }));
+                    try message_patterns.append(try allocator.dupe(MessageToken, &[_]MessageToken{ .s, .se }));
+                },
+                .X1K1 => {
+                    handshake_pattern.pre_message_pattern_responder = .s;
+                    try message_patterns.append(try allocator.dupe(MessageToken, &[_]MessageToken{.e}));
+                    try message_patterns.append(try allocator.dupe(MessageToken, &[_]MessageToken{ .e, .ee, .es }));
+                    try message_patterns.append(try allocator.dupe(MessageToken, &[_]MessageToken{.s}));
+                    try message_patterns.append(try allocator.dupe(MessageToken, &[_]MessageToken{.se}));
+                },
+
                 .XX => {
-                    try message_pattern.append(try allocator.dupe(MessageToken, &[_]MessageToken{.e}));
-                    try message_pattern.append(try allocator.dupe(MessageToken, &[_]MessageToken{ .e, .ee, .s, .es }));
-                    try message_pattern.append(try allocator.dupe(MessageToken, &[_]MessageToken{ .s, .se }));
+                    try message_patterns.append(try allocator.dupe(MessageToken, &[_]MessageToken{.e}));
+                    try message_patterns.append(try allocator.dupe(MessageToken, &[_]MessageToken{ .e, .ee, .s, .es }));
+                    try message_patterns.append(try allocator.dupe(MessageToken, &[_]MessageToken{ .s, .se }));
+                },
+                .X1X => {
+                    try message_patterns.append(try allocator.dupe(MessageToken, &[_]MessageToken{.e}));
+                    try message_patterns.append(try allocator.dupe(MessageToken, &[_]MessageToken{ .e, .ee, .s, .es }));
+                    try message_patterns.append(try allocator.dupe(MessageToken, &[_]MessageToken{.s}));
+                    try message_patterns.append(try allocator.dupe(MessageToken, &[_]MessageToken{.se}));
+                },
+                .XX1 => {
+                    try message_patterns.append(try allocator.dupe(MessageToken, &[_]MessageToken{.e}));
+                    try message_patterns.append(try allocator.dupe(MessageToken, &[_]MessageToken{ .e, .ee, .s }));
+                    try message_patterns.append(try allocator.dupe(MessageToken, &[_]MessageToken{ .es, .s, .se }));
+                },
+                .X1X1 => {
+                    try message_patterns.append(try allocator.dupe(MessageToken, &[_]MessageToken{.e}));
+                    try message_patterns.append(try allocator.dupe(MessageToken, &[_]MessageToken{ .e, .ee, .s }));
+                    try message_patterns.append(try allocator.dupe(MessageToken, &[_]MessageToken{ .es, .s }));
+                    try message_patterns.append(try allocator.dupe(MessageToken, &[_]MessageToken{.se}));
+                },
+                .IN => {
+                    try message_patterns.append(try allocator.dupe(MessageToken, &[_]MessageToken{ .e, .s }));
+                    try message_patterns.append(try allocator.dupe(MessageToken, &[_]MessageToken{ .e, .ee, .se }));
+                },
+                .I1N => {
+                    try message_patterns.append(try allocator.dupe(MessageToken, &[_]MessageToken{ .e, .s }));
+                    try message_patterns.append(try allocator.dupe(MessageToken, &[_]MessageToken{ .e, .ee }));
+                    try message_patterns.append(try allocator.dupe(MessageToken, &[_]MessageToken{.se}));
+                },
+
+                .IK => {
+                    handshake_pattern.pre_message_pattern_responder = .s;
+                    try message_patterns.append(try allocator.dupe(MessageToken, &[_]MessageToken{ .e, .es, .s, .ss }));
+                    try message_patterns.append(try allocator.dupe(MessageToken, &[_]MessageToken{ .e, .ee, .se }));
+                },
+                .I1K => {
+                    handshake_pattern.pre_message_pattern_responder = .s;
+                    try message_patterns.append(try allocator.dupe(MessageToken, &[_]MessageToken{ .e, .es, .s }));
+                    try message_patterns.append(try allocator.dupe(MessageToken, &[_]MessageToken{ .e, .ee }));
+                    try message_patterns.append(try allocator.dupe(MessageToken, &[_]MessageToken{.se}));
+                },
+                .IK1 => {
+                    handshake_pattern.pre_message_pattern_responder = .s;
+                    try message_patterns.append(try allocator.dupe(MessageToken, &[_]MessageToken{ .e, .s }));
+                    try message_patterns.append(try allocator.dupe(MessageToken, &[_]MessageToken{ .e, .ee, .se, .es }));
+                },
+                .I1K1 => {
+                    handshake_pattern.pre_message_pattern_responder = .s;
+                    try message_patterns.append(try allocator.dupe(MessageToken, &[_]MessageToken{ .e, .s }));
+                    try message_patterns.append(try allocator.dupe(MessageToken, &[_]MessageToken{ .e, .ee, .es }));
+                    try message_patterns.append(try allocator.dupe(MessageToken, &[_]MessageToken{.se}));
+                },
+                .IX => {
+                    try message_patterns.append(try allocator.dupe(MessageToken, &[_]MessageToken{ .e, .s }));
+                    try message_patterns.append(try allocator.dupe(MessageToken, &[_]MessageToken{ .e, .ee, .se, .s, .es }));
+                },
+                .I1X => {
+                    try message_patterns.append(try allocator.dupe(MessageToken, &[_]MessageToken{ .e, .s }));
+                    try message_patterns.append(try allocator.dupe(MessageToken, &[_]MessageToken{ .e, .ee, .s, .es }));
+                    try message_patterns.append(try allocator.dupe(MessageToken, &[_]MessageToken{.se}));
+                },
+                .IX1 => {
+                    try message_patterns.append(try allocator.dupe(MessageToken, &[_]MessageToken{ .e, .s }));
+                    try message_patterns.append(try allocator.dupe(MessageToken, &[_]MessageToken{ .e, .ee, .se, .s }));
+                    try message_patterns.append(try allocator.dupe(MessageToken, &[_]MessageToken{.es}));
+                },
+                .I1X1 => {
+                    try message_patterns.append(try allocator.dupe(MessageToken, &[_]MessageToken{ .e, .s }));
+                    try message_patterns.append(try allocator.dupe(MessageToken, &[_]MessageToken{ .e, .ee, .s }));
+                    try message_patterns.append(try allocator.dupe(MessageToken, &[_]MessageToken{ .se, .es }));
                 },
             }
 
-            return MessagePatternArray.fromTokens(allocator, message_pattern.items);
+            // TODO: add psk support
+            // while (modifier_it.next()) |m| {
+            //     if (std.mem.containsAtLeast(u8, m, 1, "psk")) {
+            //         const num = try std.fmt.parseInt(usize, m["psk".len .. "psk".len + 1], 10);
+
+            //         if (num == 0) {
+            //             try message_patterns[0].insert(0, .psk);
+            //         } else {
+            //             try message_patterns.insert(num - 1, .psk);
+            //         }
+            //     }
+            // }
+
+            const patterns = try MessagePatternArray.fromTokens(allocator, message_patterns.items);
+            handshake_pattern.message_patterns = patterns;
+
+            return handshake_pattern;
+        }
+
+        pub fn deinit(self: *HandshakePattern, allocator: std.mem.Allocator) void {
+            self.message_patterns.deinit(allocator);
         }
     };
 
-    pub fn init(allocator: std.mem.Allocator, protocol: []const u8, role: Role, prologue: []const u8, psks: ?[]const u8, keys: Keys) !HandshakeState {
+    pub fn init(allocator: std.mem.Allocator, protocol_name: []const u8, role: Role, prologue: []const u8, psks: ?[]const u8, keys: Keys) !HandshakeState {
+        const protocol = protocolFromName(protocol_name);
         var symmetric_state = try allocator.create(SymmetricState);
-        try symmetric_state.init(protocol);
+        try symmetric_state.init(protocol_name);
         try symmetric_state.mixHash(prologue);
 
         return .{
             .allocator = allocator,
-            .message_patterns = try Protocol.XX.messagePatterns(allocator),
+            .handshake_pattern = try .init(allocator, protocol.pattern),
             .symmetric_state = symmetric_state,
             .s = keys.s,
             .e = keys.e,
@@ -786,12 +1112,12 @@ const HandshakeState = struct {
     }
 
     pub fn deinit(self: *HandshakeState) void {
-        self.message_patterns.deinit(self.allocator);
+        self.handshake_pattern.deinit(self.allocator);
         self.allocator.destroy(self.symmetric_state);
     }
 
     pub fn write(self: *HandshakeState, writer: *std.Io.Writer, payload: []u8) !?struct { CipherState, CipherState } {
-        const pattern = self.message_patterns.next();
+        const pattern = self.handshake_pattern.message_patterns.next();
         if (pattern) |p| {
             for (p) |token| {
                 switch (token) {
@@ -844,7 +1170,7 @@ const HandshakeState = struct {
 
         try writer.writeAll(encrypted);
 
-        if (self.message_patterns.isFinished()) {
+        if (self.handshake_pattern.message_patterns.isFinished()) {
             return try self.symmetric_state.split();
         }
 
@@ -852,7 +1178,7 @@ const HandshakeState = struct {
     }
 
     pub fn read(self: *HandshakeState, reader: *std.Io.Reader) !struct { []const u8, ?struct { CipherState, CipherState } } {
-        const pattern = self.message_patterns.next();
+        const pattern = self.handshake_pattern.message_patterns.next();
         if (pattern) |p| {
             for (p) |token| {
                 switch (token) {
@@ -907,7 +1233,7 @@ const HandshakeState = struct {
         var plaintext: [MAX_MESSAGE_LEN]u8 = undefined;
         const payload = try self.symmetric_state.decryptAndHash(&plaintext, reader.buffered());
 
-        const cipher_state = if (self.message_patterns.isFinished()) try self.symmetric_state.split() else null;
+        const cipher_state = if (self.handshake_pattern.message_patterns.isFinished()) try self.symmetric_state.split() else null;
 
         return .{ payload, cipher_state };
     }
