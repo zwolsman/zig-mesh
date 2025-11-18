@@ -1335,7 +1335,7 @@ const Message = struct {
 
 /// Represents a cacophony test vector.
 ///
-/// The members of a `Vector` struct correspond to a vector object found within cacophony.txt.
+/// The members of a `Vector` struct correspond to a vector object found within cacophony.json.
 const Vector = struct {
     protocol_name: []const u8,
     init_prologue: []const u8,
@@ -1391,12 +1391,12 @@ test "cacophony" {
     std.testing.log_level = .debug;
     const allocator = std.testing.allocator;
 
-    const cacophony_txt = try std.fs.cwd().openFile("/Users/mzwolsman/Developer/zigio-mesh/vectors/cacophony.txt", .{});
+    const cacophony_txt = try std.fs.cwd().openFile("./vectors/cacophony.json", .{});
     defer cacophony_txt.close();
     const buf: []u8 = try cacophony_txt.readToEndAlloc(allocator, 5_000_000);
     defer allocator.free(buf);
 
-    // Validate .txt is loaded as json correctly
+    // Validate .json is loaded as json correctly
     try std.testing.expect(try std.json.validate(allocator, buf));
     const data = try std.json.parseFromSlice(Vectors, allocator, buf[0..], .{});
     defer data.deinit();
@@ -1405,17 +1405,19 @@ test "cacophony" {
     var failed_vector_count: usize = 0;
     var ignored_vector_count: usize = 0;
 
-    std.debug.print("Found {} total vectors.\n", .{total_vector_count});
+    std.log.debug("Found {} total vectors.", .{total_vector_count});
 
     vector_test: for (data.value.vectors, 0..) |vector, vector_num| {
         const protocol = protocolFromName(vector.protocol_name);
 
+        // Zig only supports the 25519 curve
         if (!std.mem.eql(u8, protocol.dh, "25519")) {
             ignored_vector_count += 1;
             continue;
         }
 
-        std.debug.print("\n***** Testing: {s} *****\n", .{vector.protocol_name});
+        std.log.debug("Testing: {s}", .{vector.protocol_name});
+
         const init_s = if (vector.init_static) |s| try keypairFromSecretKey(s) else null;
         const init_e = try keypairFromSecretKey(vector.init_ephemeral);
 
@@ -1533,7 +1535,6 @@ test "cacophony" {
                 continue :vector_test;
             };
 
-            // TODO: check update reader
             receive_reader.end = send_writer.end;
             expected = try std.fmt.hexToBytes(&expected_buf, m.payload);
             const receive_payload, const receiver_cipherstates = receiver.read(&receive_reader) catch |e| {
@@ -1565,7 +1566,7 @@ test "cacophony" {
                 }
                 break :handshake_phase;
             }
-            // std.debug.print("Vector \"{s}\" ({}) message {} OK\n", .{ vector.protocol_name, vector_num + 1, k });
+            std.log.debug("message {} OK", .{k});
         }
 
         try std.testing.expectEqualSlices(u8, initiator.handshakeHash(), responder.handshakeHash());
@@ -1617,8 +1618,8 @@ test "cacophony" {
                 std.debug.print("Vector \"{s}\" ({}) failed after decryptWithAd\n", .{ vector.protocol_name, vector_num + 1 });
                 continue :vector_test;
             };
-            // std.debug.print("Vector \"{s}\" ({}) message {} OK\n", .{ vector.protocol_name, vector_num + 1, k });
+            std.log.debug("message {} OK{s}", .{ k, if (k == vector.messages.len - 1) "\n" else "" });
         }
     }
-    std.debug.print("***** {} out of {} vectors passed ({} ignored, {} failed). *****\n", .{ total_vector_count - failed_vector_count - ignored_vector_count, total_vector_count, ignored_vector_count, failed_vector_count });
+    std.log.debug("***** {} out of {} vectors passed ({} ignored, {} failed). *****", .{ total_vector_count - failed_vector_count - ignored_vector_count, total_vector_count, ignored_vector_count, failed_vector_count });
 }
