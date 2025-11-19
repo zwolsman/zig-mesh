@@ -132,6 +132,9 @@ pub const Node = struct {
         const peer = Peer.init(try self.allocator.create(Peer), rt, stream, .{
             .public_key = handshake.public_key,
             .address = handshake.address,
+        }, .{
+            .recv = handshake.recv,
+            .write = handshake.send,
         });
         log.debug("Peer handshake: {f} (ok)", .{peer.id});
 
@@ -219,7 +222,7 @@ pub const Peer = struct {
 
     pub const Error = error{HandshakeFailed};
 
-    pub fn init(peer: *Peer, rt: *zio.Runtime, stream: zio.net.Stream, id: ID) *Peer {
+    pub fn init(peer: *Peer, rt: *zio.Runtime, stream: zio.net.Stream, id: ID, ciphers: struct { recv: noise.CipherState, write: noise.CipherState }) *Peer {
         peer.* = .{
             .rt = rt,
             .id = id,
@@ -236,7 +239,7 @@ pub const Peer = struct {
             .reader = stream.reader(rt, &peer.tcp_read_buffer),
             .writer = stream.writer(rt, &peer.tcp_write_buffer),
 
-            .conn = ConnectionClient.init(&peer.reader.interface, &peer.writer.interface, &peer.conn_read_buffer, &peer.conn_write_buffer),
+            .conn = ConnectionClient.initWithCiphers(&peer.reader.interface, &peer.writer.interface, &peer.conn_read_buffer, &peer.conn_write_buffer, ciphers.recv, ciphers.write),
             .responses = ResponseChannel.init(&peer.responses_buffer),
         };
 
@@ -251,11 +254,16 @@ pub const Peer = struct {
         send: noise.CipherState,
         recv: noise.CipherState,
     } {
-        var read_buffer: [512]u8 = undefined;
-        var reader = stream.reader(rt, &read_buffer);
+        var tcp_read_buffer: [512]u8 = undefined;
+        var tcp_reader = stream.reader(rt, &tcp_read_buffer);
 
-        var write_buffer: [512]u8 = undefined;
-        var writer = stream.writer(rt, &write_buffer);
+        var tcp_write_buffer: [512]u8 = undefined;
+        var tcp_writer = stream.writer(rt, &tcp_write_buffer);
+
+        var conn_read_buffer: [512]u8 = undefined;
+        var conn_write_buffer: [512]u8 = undefined;
+
+        var conn: ConnectionClient = .init(&tcp_reader.interface, &tcp_writer.interface, &conn_read_buffer, &conn_write_buffer);
 
         log.debug("starting handshake ({s} - {})", .{ NOISE_PROTOCOL_NAME, role });
 
@@ -266,12 +274,13 @@ pub const Peer = struct {
             defer state.deinit();
 
             // Stage 1
-            _ = try state.write(&writer.interface, &.{});
-            try writer.interface.flush();
+            _ = try state.write(&conn.writer, &.{});
+            try conn.writer.flush();
+            try tcp_writer.interface.flush();
             log.debug("Stage 1 (ok)", .{});
 
             // Stage 2
-            const remote_payload, _ = try state.read(&reader.interface);
+            const remote_payload, _ = try state.read(&conn.reader);
 
             const raw_pub = remote_payload[0..std.crypto.sign.Ed25519.PublicKey.encoded_length];
             const remote_pub = try std.crypto.sign.Ed25519.PublicKey.fromBytes(raw_pub.*);
@@ -283,11 +292,12 @@ pub const Peer = struct {
 
             // Stage 3
             const payload = kp.public_key.bytes ++ (try kp.sign(&kp.public_key.bytes, null)).toBytes();
-            const chains = try state.write(&writer.interface, &payload);
+            const chains = try state.write(&conn.writer, &payload);
             if (chains == null) {
                 return error.HandshakeFailed;
             }
-            try writer.interface.flush();
+            try conn.writer.flush();
+            try tcp_writer.interface.flush();
 
             log.debug("Stage 3 payload: {x}..{x} (ok)", .{ payload[0..8], payload[payload.len - 8 ..] });
             log.debug("handshake hash: {x}", .{state.handshakeHash()});
@@ -305,17 +315,19 @@ pub const Peer = struct {
             defer state.deinit();
 
             // Stage 1
-            _ = try state.read(&reader.interface);
+            _ = try state.read(&conn.reader);
             log.debug("Stage 1 (ok)", .{});
 
             // Stage 2
             const payload: [96]u8 = kp.public_key.bytes ++ (try kp.sign(&kp.public_key.bytes, null)).toBytes();
-            _ = try state.write(&writer.interface, &payload);
-            try writer.interface.flush();
+            _ = try state.write(&conn.writer, &payload);
+            try conn.writer.flush();
+            try tcp_writer.interface.flush();
+
             log.debug("Stage 2 payload: {x}..{x} (ok)", .{ payload[0..8], payload[payload.len - 8 ..] });
 
             // Stage 3
-            const remote_payload, const chains = try state.read(&reader.interface);
+            const remote_payload, const chains = try state.read(&conn.reader);
             if (chains == null) {
                 return error.InvalidHandshakeState;
             }
@@ -431,6 +443,8 @@ const PeerStore = struct {
 
 pub const ConnectionClient = struct {
     const log = std.log.scoped(.connection_client);
+
+    const MIN_BUFFER_LEN = 256;
     /// The buffer is asserted to have capacity at least `min_buffer_len`.
     input: *std.Io.Reader,
     /// Decrypted stream from the server to the client.
@@ -443,6 +457,9 @@ pub const ConnectionClient = struct {
     output: *std.Io.Writer,
     /// The plaintext stream from the client to the server.
     writer: std.Io.Writer,
+
+    write_cipher: ?noise.CipherState = null,
+    recv_cipher: ?noise.CipherState = null,
 
     pub fn init(input: *std.Io.Reader, output: *std.Io.Writer, read_buffer: []u8, write_buffer: []u8) ConnectionClient {
         return .{
@@ -465,6 +482,14 @@ pub const ConnectionClient = struct {
                 },
             },
         };
+    }
+
+    pub fn initWithCiphers(input: *std.Io.Reader, output: *std.Io.Writer, read_buffer: []u8, write_buffer: []u8, recv_cipher: noise.CipherState, write_cipher: noise.CipherState) ConnectionClient {
+        var conn = init(input, output, read_buffer, write_buffer);
+        conn.recv_cipher = recv_cipher;
+        conn.write_cipher = write_cipher;
+
+        return conn;
     }
 
     fn stream(r: *std.Io.Reader, w: *std.Io.Writer, limit: std.Io.Limit) std.Io.Reader.StreamError!usize {
@@ -491,7 +516,7 @@ pub const ConnectionClient = struct {
         const packet_header = try input.peek(Packet.HEADER_LEN);
         const packet_version = std.mem.readInt(u8, packet_header[0..1], .big);
         const packet_size = std.mem.readInt(u16, packet_header[1..3], .big);
-        const packet_end = packet_size + Packet.HEADER_LEN;
+        const packet_end: u16 = if (c.recv_cipher != null) packet_size + Packet.HEADER_LEN + 16 else packet_size + Packet.HEADER_LEN;
 
         log.debug("peeked (version={d}, size={d}, end={d}) {any}", .{ packet_version, packet_size, packet_end, packet_header });
         log.debug("buffer: {any}", .{input.buffered()});
@@ -511,11 +536,16 @@ pub const ConnectionClient = struct {
         log.debug("prepped buffer: {any}", .{input.buffered()});
 
         rebase(r, packet_end);
-        _ = try input.take(Packet.HEADER_LEN); // already peaked
-        const buf = try input.take(packet_size); // actual packet
+        input.toss(Packet.HEADER_LEN); // already peaked
+        const packet_buffer = try input.take(packet_end - Packet.HEADER_LEN); // actual packet
 
-        @memcpy(r.buffer[r.end..][0..packet_size], buf);
-
+        if (c.recv_cipher != null) {
+            _ = c.recv_cipher.?.decryptWithAd(r.buffer[r.end..], "", packet_buffer) catch {
+                return error.ReadFailed;
+            };
+        } else {
+            @memcpy(r.buffer[r.end..][0..packet_size], packet_buffer);
+        }
         // Should be packet size but it's not wrapped yet
         r.end += packet_size;
         return packet_size;
@@ -533,21 +563,21 @@ pub const ConnectionClient = struct {
     fn drain(w: *std.Io.Writer, data: []const []const u8, splat: usize) std.Io.Writer.Error!usize {
         const c: *ConnectionClient = @alignCast(@fieldParentPtr("writer", w));
         const output = c.output;
-        const output_buffer = try output.writableSliceGreedy(100); // min_buffer_len
+        const output_buffer = try output.writableSliceGreedy(MIN_BUFFER_LEN);
 
         var in_end: usize = 0;
         var buf_end: usize = 0;
         done: {
             {
                 const buf = w.buffered();
-                const in_len, const buf_len = try writePacket(output_buffer[buf_end..], buf);
+                const in_len, const buf_len = try c.writePacket(output_buffer[buf_end..], buf);
 
                 buf_end += buf_len;
                 in_end += in_len;
                 if (in_len < buf.len) break :done;
             }
             for (data[0 .. data.len - 1]) |buf| {
-                const in_len, const buf_len = try writePacket(output_buffer[buf_end..], buf);
+                const in_len, const buf_len = try c.writePacket(output_buffer[buf_end..], buf);
 
                 buf_end += buf_len;
                 in_end += in_len;
@@ -555,7 +585,7 @@ pub const ConnectionClient = struct {
             }
             const buf = data[data.len - 1];
             for (0..splat) |_| {
-                const in_len, const buf_len = try writePacket(output_buffer[buf_end..], buf);
+                const in_len, const buf_len = try c.writePacket(output_buffer[buf_end..], buf);
 
                 buf_end += buf_len;
                 in_end += in_len;
@@ -570,25 +600,34 @@ pub const ConnectionClient = struct {
     fn flush(w: *std.Io.Writer) std.Io.Writer.Error!void {
         const c: *ConnectionClient = @alignCast(@fieldParentPtr("writer", w));
         const output = c.output;
-        const output_buffer = try output.writableSliceGreedy(100); // min_buffer_len
+        const output_buffer = try output.writableSliceGreedy(MIN_BUFFER_LEN);
         const buf = w.buffered();
 
-        _, const buf_len = try writePacket(output_buffer, buf);
+        _, const buf_len = try c.writePacket(output_buffer, buf);
 
         log.debug("flushing {any}", .{output_buffer[0..buf_len]});
         output.advance(buf_len);
         w.end = 0;
     }
 
-    fn writePacket(output: []u8, data: []const u8) !struct { usize, usize } {
+    fn writePacket(c: *ConnectionClient, output: []u8, data: []const u8) !struct { usize, usize } {
         var writer = std.Io.Writer.fixed(output);
         try writer.writeInt(u8, 1, .big); // version always set to 1
         try writer.writeInt(u16, @intCast(data.len), .big);
-        const len = try writer.write(data);
+
+        if (c.write_cipher != null) {
+            const encrypted = c.write_cipher.?.encryptWithAd(writer.unusedCapacitySlice(), "", data) catch {
+                return error.WriteFailed;
+            };
+
+            writer.advance(encrypted.len);
+        } else {
+            try writer.writeAll(data);
+        }
 
         return .{
-            len,
-            len + Packet.HEADER_LEN,
+            data.len,
+            writer.end,
         };
     }
 };
