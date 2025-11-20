@@ -3,6 +3,7 @@ const std = @import("std");
 const flags = @import("flags");
 const zio = @import("zio");
 
+const mdns = @import("./mdns.zig");
 const net = @import("./net.zig");
 const Node = @import("./node.zig").Node;
 const Packet = @import("./packet.zig");
@@ -52,6 +53,18 @@ pub fn main() !void {
 
     var node_job = try rt.spawn(Node.run, .{ &node, rt }, .{});
     node_job.detach(rt);
+
+    const service_name = try std.fmt.allocPrint(allocator, "tcp://{x}", .{&node.id.public_key});
+    defer allocator.free(service_name);
+
+    var mdns_service = try mdns.mDNSService.init(rt, .{ .name = service_name, .port = node.server.?.socket.address.ip.getPort() });
+    defer mdns_service.deinit();
+
+    var mdns_job = try rt.spawn(mdns.mDNSService.run, .{ &mdns_service, rt }, .{});
+    mdns_job.detach(rt);
+
+    // try to query
+    try mdns_service.query(rt);
 
     var bootstrap_job = try rt.spawn(bootstrapNode, .{ rt, &node, options.positional.trailing }, .{});
     bootstrap_job.detach(rt);
