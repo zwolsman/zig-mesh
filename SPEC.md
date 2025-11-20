@@ -8,14 +8,14 @@ This document outlines the packet structure. The packets utilize big-endian enco
 
 Each packet comprises the following **header**:
 
-| Field            | Type  | Description                                      |
-| ---------------- | ----- | ------------------------------------------------ |
-| `packet_version` | `u8`  | Currently set to "1"                             |
-| `content_type`   | `u8`  | 0 = invalid, 1 = handshake, 2 = application_data |
-| `packet_length`  | `u16` | The number of bytes that need to be read         |
+| Field            | Type  | Description                              |
+| ---------------- | ----- | ---------------------------------------- |
+| `packet_version` | `u8`  | Currently set to "1"                     |
+| `content_type`   | `u8`  | 0 = handshake, 1 = application_data      |
+| `packet_length`  | `u16` | The number of bytes that need to be read |
 
 > [!IMPORTANT]  
-> Once the `content_type` is 2 (`application_data`) the content is encrypted. An authentication tag is appended after the packet body. This means you need to read `packet_length + 16` and decrypt accordingly.
+> Once the `content_type` is 1 (`application_data`) the content is encrypted. An authentication tag is appended after the packet body. This means you need to read `packet_length + 16` and decrypt accordingly.
 
 ### Handshake
 
@@ -59,13 +59,14 @@ Each packet contains the following fields:
 
 | Field | Type | Description |
 | ----- | ---- | ----------- |
+|       |      |             |
 
 ### Echo Packet
 
-| Field | Type | Description                |
-| ----- | ---- | -------------------------- |
-| len   | u16  | length of the payload body |
-| bytes | []u8 | message                    |
+| Field | Type   | Description                |
+| ----- | ------ | -------------------------- |
+| len   | `u16`  | length of the payload body |
+| bytes | `[]u8` | message                    |
 
 ## Encoding Details
 

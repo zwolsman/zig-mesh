@@ -442,10 +442,9 @@ const PeerStore = struct {
 
 pub const ConnectionClient = struct {
     const log = std.log.scoped(.connection_client);
-    const ContentType = enum(u8) {
-        invalid = 0,
-        handshake = 1,
-        application_data = 2,
+    const ContentType = enum {
+        handshake,
+        application_data,
     };
 
     const MIN_BUFFER_LEN = 256;
