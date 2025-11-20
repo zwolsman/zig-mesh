@@ -285,12 +285,12 @@ pub const Peer = struct {
             const remote_pub = try std.crypto.sign.Ed25519.PublicKey.fromBytes(raw_pub.*);
             const raw_sig = remote_payload[std.crypto.sign.Ed25519.PublicKey.encoded_length .. std.crypto.sign.Ed25519.PublicKey.encoded_length + std.crypto.sign.Ed25519.Signature.encoded_length];
             const remote_sig = std.crypto.sign.Ed25519.Signature.fromBytes(raw_sig.*);
-            try remote_sig.verify(&remote_pub.bytes, remote_pub);
+            try remote_sig.verify(&state.rs.?, remote_pub);
 
             log.debug("Stage 2 pub: {x}..{x}, sig: {x}..{x} (ok)", .{ raw_pub[0..8], raw_pub[raw_pub.len - 8 ..], raw_sig[0..8], raw_sig[raw_sig.len - 8 ..] });
 
             // Stage 3
-            const payload = kp.public_key.bytes ++ (try kp.sign(&kp.public_key.bytes, null)).toBytes();
+            const payload = kp.public_key.bytes ++ (try kp.sign(&state.s.public_key, null)).toBytes();
             const chains = try state.write(&conn.writer, &payload);
             if (chains == null) {
                 return error.HandshakeFailed;
@@ -318,7 +318,7 @@ pub const Peer = struct {
             log.debug("Stage 1 (ok)", .{});
 
             // Stage 2
-            const payload: [96]u8 = kp.public_key.bytes ++ (try kp.sign(&kp.public_key.bytes, null)).toBytes();
+            const payload: [96]u8 = kp.public_key.bytes ++ (try kp.sign(&state.s.public_key, null)).toBytes();
             _ = try state.write(&conn.writer, &payload);
             try conn.writer.flush();
             try tcp_writer.interface.flush();
@@ -335,7 +335,7 @@ pub const Peer = struct {
             const remote_pub = try std.crypto.sign.Ed25519.PublicKey.fromBytes(raw_pub.*);
             const raw_sig = remote_payload[std.crypto.sign.Ed25519.PublicKey.encoded_length .. std.crypto.sign.Ed25519.PublicKey.encoded_length + std.crypto.sign.Ed25519.Signature.encoded_length];
             const remote_sig = std.crypto.sign.Ed25519.Signature.fromBytes(raw_sig.*);
-            try remote_sig.verify(&remote_pub.bytes, remote_pub);
+            try remote_sig.verify(&state.rs.?, remote_pub);
 
             log.debug("Stage 3 pub: {x}..{x}, sig: {x}..{x} (ok)", .{ raw_pub[0..8], raw_pub[raw_pub.len - 8 ..], raw_sig[0..8], raw_sig[raw_sig.len - 8 ..] });
             log.debug("handshake hash: {x}", .{state.handshakeHash()});

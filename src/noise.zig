@@ -811,10 +811,10 @@ pub const HandshakeState = struct {
     role: Role,
 
     /// The local static key pair
-    s: ?std.crypto.dh.X25519.KeyPair = null,
+    s: std.crypto.dh.X25519.KeyPair,
 
     /// The local ephemeral key pair
-    e: ?std.crypto.dh.X25519.KeyPair = null,
+    e: std.crypto.dh.X25519.KeyPair,
 
     /// rs: The remote party's static public key
     rs: ?[std.crypto.dh.X25519.public_length]u8,
@@ -1178,8 +1178,8 @@ pub const HandshakeState = struct {
             .allocator = allocator,
             .handshake_pattern = pattern,
             .symmetric_state = symmetric_state,
-            .s = keys.s,
-            .e = keys.e,
+            .s = keys.s orelse .generate(),
+            .e = keys.e orelse .generate(),
             .rs = keys.rs,
             .re = keys.re,
             .role = role,
@@ -1199,41 +1199,35 @@ pub const HandshakeState = struct {
             for (p) |token| {
                 switch (token) {
                     .e => {
-                        if (!builtin.is_test) {
-                            const kp = std.crypto.dh.X25519.KeyPair.generate();
-                            self.e = kp;
-                        }
-
-                        const public_key = self.e.?.public_key;
-                        try writer.writeAll(&public_key);
-                        try self.symmetric_state.mixHash(&public_key);
-                        if (self.psks) |psks| if (psks.len > 0) try self.symmetric_state.mixKey(&public_key);
+                        try writer.writeAll(&self.e.public_key);
+                        try self.symmetric_state.mixHash(&self.e.public_key);
+                        if (self.psks) |psks| if (psks.len > 0) try self.symmetric_state.mixKey(&self.e.public_key);
                     },
                     .s => {
                         var cipher_text: [48]u8 = undefined;
-                        const key = try self.symmetric_state.encryptAndHash(&cipher_text, &self.s.?.public_key);
+                        const key = try self.symmetric_state.encryptAndHash(&cipher_text, &self.s.public_key);
 
                         try writer.writeAll(key);
                     },
                     .ee => {
-                        const key = try std.crypto.dh.X25519.scalarmult(self.e.?.secret_key, self.re.?);
+                        const key = try std.crypto.dh.X25519.scalarmult(self.e.secret_key, self.re.?);
 
                         try self.symmetric_state.mixKey(&key);
                     },
                     .es => {
-                        const kp, const public_key = if (self.role == .initiator) .{ self.e.?, self.rs.? } else .{ self.s.?, self.re.? };
+                        const kp, const public_key = if (self.role == .initiator) .{ self.e, self.rs.? } else .{ self.s, self.re.? };
                         const key = try std.crypto.dh.X25519.scalarmult(kp.secret_key, public_key);
 
                         try self.symmetric_state.mixKey(&key);
                     },
                     .se => {
-                        const kp, const public_key = if (self.role == .initiator) .{ self.s.?, self.re.? } else .{ self.e.?, self.rs.? };
+                        const kp, const public_key = if (self.role == .initiator) .{ self.s, self.re.? } else .{ self.e, self.rs.? };
                         const key = try std.crypto.dh.X25519.scalarmult(kp.secret_key, public_key);
 
                         try self.symmetric_state.mixKey(&key);
                     },
                     .ss => {
-                        const key = try std.crypto.dh.X25519.scalarmult(self.s.?.secret_key, self.rs.?);
+                        const key = try std.crypto.dh.X25519.scalarmult(self.s.secret_key, self.rs.?);
 
                         try self.symmetric_state.mixKey(&key);
                     },
@@ -1281,24 +1275,24 @@ pub const HandshakeState = struct {
                         _ = try self.symmetric_state.decryptAndHash(&self.rs.?, key);
                     },
                     .ee => {
-                        const key = try std.crypto.dh.X25519.scalarmult(self.e.?.secret_key, self.re.?);
+                        const key = try std.crypto.dh.X25519.scalarmult(self.e.secret_key, self.re.?);
 
                         try self.symmetric_state.mixKey(&key);
                     },
                     .es => {
-                        const kp, const public_key = if (self.role == .initiator) .{ self.e.?, self.rs.? } else .{ self.s.?, self.re.? };
+                        const kp, const public_key = if (self.role == .initiator) .{ self.e, self.rs.? } else .{ self.s, self.re.? };
                         const key = try std.crypto.dh.X25519.scalarmult(kp.secret_key, public_key);
 
                         try self.symmetric_state.mixKey(&key);
                     },
                     .se => {
-                        const kp, const public_key = if (self.role == .initiator) .{ self.s.?, self.re.? } else .{ self.e.?, self.rs.? };
+                        const kp, const public_key = if (self.role == .initiator) .{ self.s, self.re.? } else .{ self.e, self.rs.? };
                         const key = try std.crypto.dh.X25519.scalarmult(kp.secret_key, public_key);
 
                         try self.symmetric_state.mixKey(&key);
                     },
                     .ss => {
-                        const key = try std.crypto.dh.X25519.scalarmult(self.s.?.secret_key, self.rs.?);
+                        const key = try std.crypto.dh.X25519.scalarmult(self.s.secret_key, self.rs.?);
 
                         try self.symmetric_state.mixKey(&key);
                     },
