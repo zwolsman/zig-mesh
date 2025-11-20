@@ -97,7 +97,7 @@ fn handleEcho(
     defer allocator.free(msg);
 
     _ = try Packet.writePacket(&peer.conn.writer, .command, .{ .echo = .{ .message = msg } });
-    try peer.conn.output.flush();
+    try peer.conn.flush();
 
     log.debug("Echo sent: {s}!", .{msg});
 }
@@ -118,7 +118,7 @@ fn handlePing(
 
     log.debug("Found peer: {f}.. writing", .{peer.id});
     const req_id = (try Packet.writePacket(&peer.conn.writer, .request, .ping)).?;
-    try peer.conn.output.flush();
+    try peer.conn.flush();
 
     log.debug("Ping sent (id={x})!", .{req_id});
 

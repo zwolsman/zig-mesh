@@ -186,7 +186,7 @@ pub const Node = struct {
                     log.debug("{f}: ping", .{peer.id});
 
                     _ = try Packet.writePacket(&peer.conn.writer, .{ .response = op.request }, .ping);
-                    try peer.conn.output.flush();
+                    try peer.conn.flush();
                 },
                 else => return error.UnexpectedOp,
             },
@@ -265,7 +265,7 @@ pub const Peer = struct {
 
         var conn: ConnectionClient = .init(&tcp_reader.interface, &tcp_writer.interface, &conn_read_buffer, &conn_write_buffer);
 
-        log.debug("starting handshake ({s} - {})", .{ NOISE_PROTOCOL_NAME, role });
+        log.debug("Starting handshake ({s} - {})", .{ NOISE_PROTOCOL_NAME, role });
 
         if (role == .initiator) {
             var state = try noise.HandshakeState.init(allocator, NOISE_PROTOCOL_NAME, .initiator, null, null, .{
@@ -275,8 +275,7 @@ pub const Peer = struct {
 
             // Stage 1
             _ = try state.write(&conn.writer, &.{});
-            try conn.writer.flush();
-            try tcp_writer.interface.flush();
+            try conn.flush();
             log.debug("Stage 1 (ok)", .{});
 
             // Stage 2
@@ -478,7 +477,7 @@ pub const ConnectionClient = struct {
                 .buffer = write_buffer,
                 .vtable = &.{
                     .drain = drain,
-                    .flush = flush,
+                    .flush = flush_,
                 },
             },
         };
@@ -490,6 +489,11 @@ pub const ConnectionClient = struct {
         conn.write_cipher = write_cipher;
 
         return conn;
+    }
+
+    pub fn flush(self: *ConnectionClient) !void {
+        try self.writer.flush();
+        try self.output.flush();
     }
 
     fn stream(r: *std.Io.Reader, w: *std.Io.Writer, limit: std.Io.Limit) std.Io.Reader.StreamError!usize {
@@ -597,7 +601,7 @@ pub const ConnectionClient = struct {
         return w.consume(in_end);
     }
 
-    fn flush(w: *std.Io.Writer) std.Io.Writer.Error!void {
+    fn flush_(w: *std.Io.Writer) std.Io.Writer.Error!void {
         const c: *ConnectionClient = @alignCast(@fieldParentPtr("writer", w));
         const output = c.output;
         const output_buffer = try output.writableSliceGreedy(MIN_BUFFER_LEN);

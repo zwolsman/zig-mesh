@@ -55,7 +55,6 @@ pub fn writePacket(writer: *std.Io.Writer, op: union(OpType) {
 
     // Body
     try writeTag(writer, tag);
-    try writer.flush();
 
     return id;
 }

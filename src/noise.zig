@@ -14,8 +14,8 @@ pub const MAX_HASH_LEN = 64;
 
 const Role = enum { initiator, responder };
 
-const ChaCha20Poly1305CipherState = CipherState_(std.crypto.aead.chacha_poly.ChaCha20Poly1305);
-const Aes256GcmCipherState = CipherState_(std.crypto.aead.aes_gcm.Aes256Gcm);
+const ChaCha20Poly1305CipherState = CipherStateT(std.crypto.aead.chacha_poly.ChaCha20Poly1305);
+const Aes256GcmCipherState = CipherStateT(std.crypto.aead.aes_gcm.Aes256Gcm);
 
 const Sha256Hash = Hash(std.crypto.hash.sha2.Sha256);
 const Sha512Hash = Hash(std.crypto.hash.sha2.Sha512);
@@ -36,7 +36,6 @@ const PreMessagePattern = enum {
     e,
     s,
     es,
-    empty,
 };
 
 /// The following handshake patterns represent interactive protocols. These 12 patterns are called the fundamental interactive handshake patterns.
@@ -257,8 +256,8 @@ pub const CipherState = union(enum) {
     }
 };
 
-fn CipherState_(comptime C: type) type {
-    const cipher = Cipher(C);
+fn CipherStateT(comptime C: type) type {
+    const cipher = CipherT(C);
 
     return struct {
         const Self = @This();
@@ -331,16 +330,16 @@ fn CipherState_(comptime C: type) type {
     };
 }
 
-fn Cipher(comptime cipher: type) type {
-    comptime switch (cipher) {
+fn CipherT(comptime Cipher: type) type {
+    comptime switch (Cipher) {
         std.crypto.aead.aes_gcm.Aes256Gcm, std.crypto.aead.chacha_poly.ChaCha20Poly1305 => {},
-        else => @compileError(std.fmt.comptimePrint("Unsupported cipher: {any}", .{cipher})),
+        else => @compileError(std.fmt.comptimePrint("Unsupported cipher: {any}", .{Cipher})),
     };
 
     return struct {
-        const tag_length = cipher.tag_length;
-        const nonce_length = cipher.nonce_length;
-        const key_length = cipher.key_length;
+        const tag_length = Cipher.tag_length;
+        const nonce_length = Cipher.nonce_length;
+        const key_length = Cipher.key_length;
 
         /// Encrypts `plaintext` using the cipher key `k` of 32 bytes and an 8-byte unsigned integer nonce `n` which must be unique for the key `k`.
         ///
@@ -355,7 +354,7 @@ fn Cipher(comptime cipher: type) type {
             std.debug.assert(ciphertext.len >= plaintext.len + tag_length);
 
             var tag: [tag_length]u8 = undefined;
-            cipher.encrypt(ciphertext[0..plaintext.len], tag[0..], plaintext, ad, nonce, k);
+            Cipher.encrypt(ciphertext[0..plaintext.len], tag[0..], plaintext, ad, nonce, k);
 
             @memcpy(ciphertext[plaintext.len .. plaintext.len + tag_length], &tag);
             return ciphertext[0 .. plaintext.len + tag_length];
@@ -373,7 +372,7 @@ fn Cipher(comptime cipher: type) type {
         ) ![]const u8 {
             var tag: [tag_length]u8 = undefined;
             @memcpy(tag[0..], ciphertext[ciphertext.len - tag_length .. ciphertext.len]);
-            try cipher.decrypt(plaintext[0 .. ciphertext.len - tag_length], ciphertext[0 .. ciphertext.len - tag_length], tag, ad, nonce, k);
+            try Cipher.decrypt(plaintext[0 .. ciphertext.len - tag_length], ciphertext[0 .. ciphertext.len - tag_length], tag, ad, nonce, k);
 
             return plaintext[0 .. ciphertext.len - tag_length];
         }
@@ -473,8 +472,8 @@ test "rekey" {
             const ad = "Additional data";
 
             const ciphertext = try std.testing.allocator.alloc(u8, m.len + 16);
+            defer allocator.free(ciphertext);
             const ciphertext1 = try sender.encryptWithAd(ciphertext, ad, m);
-            defer allocator.free(ciphertext1);
 
             try sender.rekey();
             const ciphertext2 = try std.testing.allocator.alloc(u8, m.len + 16);
@@ -491,7 +490,7 @@ test "rekey" {
 
 test "cipherState - encrypt aes" {
     const key: [std.crypto.aead.aes_gcm.Aes256Gcm.key_length]u8 = [_]u8{0x69} ** std.crypto.aead.aes_gcm.Aes256Gcm.key_length;
-    var s = CipherState_(std.crypto.aead.aes_gcm.Aes256Gcm).init(key);
+    var s = CipherStateT(std.crypto.aead.aes_gcm.Aes256Gcm).init(key);
     const nonce: [std.crypto.aead.aes_gcm.Aes256Gcm.nonce_length]u8 = [_]u8{0x42} ** std.crypto.aead.aes_gcm.Aes256Gcm.nonce_length;
     const m = "Test with message";
     const ad = "Test with associated data";
@@ -1331,34 +1330,6 @@ pub const HandshakeState = struct {
     }
 };
 
-const Vectors = struct {
-    vectors: []const Vector,
-};
-
-const Message = struct {
-    payload: []const u8,
-    ciphertext: []const u8,
-};
-
-/// Represents a cacophony test vector.
-///
-/// The members of a `Vector` struct correspond to a vector object found within cacophony.json.
-const Vector = struct {
-    protocol_name: []const u8,
-    init_prologue: []const u8,
-    init_psks: ?[][]const u8 = null,
-    init_ephemeral: []const u8,
-    init_remote_static: ?[]const u8 = null,
-    init_static: ?[]const u8 = null,
-    resp_prologue: []const u8,
-    resp_psks: ?[][]const u8 = null,
-    resp_static: ?[]const u8 = null,
-    resp_ephemeral: ?[]const u8 = null,
-    resp_remote_static: ?[]const u8 = null,
-    handshake_hash: []const u8,
-    messages: []const Message,
-};
-
 const Protocol = struct {
     pattern: []const u8,
     dh: []const u8,
@@ -1397,7 +1368,33 @@ fn keypairFromSecretKey(raw_secret_key: []const u8) !std.crypto.dh.X25519.KeyPai
 }
 
 test "cacophony" {
-    std.testing.log_level = .debug;
+    const Message = struct {
+        payload: []const u8,
+        ciphertext: []const u8,
+    };
+
+    // Represents a cacophony test vector.
+    // The members of a `Vector` struct correspond to a vector object found within cacophony.json.
+    const Vector = struct {
+        protocol_name: []const u8,
+        init_prologue: []const u8,
+        init_psks: ?[][]const u8 = null,
+        init_ephemeral: []const u8,
+        init_remote_static: ?[]const u8 = null,
+        init_static: ?[]const u8 = null,
+        resp_prologue: []const u8,
+        resp_psks: ?[][]const u8 = null,
+        resp_static: ?[]const u8 = null,
+        resp_ephemeral: ?[]const u8 = null,
+        resp_remote_static: ?[]const u8 = null,
+        handshake_hash: []const u8,
+        messages: []const Message,
+    };
+
+    const Vectors = struct {
+        vectors: []const Vector,
+    };
+
     const allocator = std.testing.allocator;
 
     const cacophony_txt = try std.fs.cwd().openFile("./vectors/cacophony.json", .{});
