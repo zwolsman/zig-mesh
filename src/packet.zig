@@ -24,11 +24,6 @@ pub const Tag = union(PacketType) {
     echo: struct { message: []u8 },
 };
 
-const MAX_PACKET_SIZE = 128;
-const PACKET_VERSION: u8 = 1;
-
-pub const HEADER_LEN = 3; // version(u8) + len(u16)
-
 pub fn writePacket(writer: *std.Io.Writer, op: union(OpType) {
     request: void,
     response: ID,

@@ -442,6 +442,11 @@ const PeerStore = struct {
 
 pub const ConnectionClient = struct {
     const log = std.log.scoped(.connection_client);
+    const ContentType = enum(u8) {
+        invalid = 0,
+        handshake = 1,
+        application_data = 2,
+    };
 
     const MIN_BUFFER_LEN = 256;
     /// The buffer is asserted to have capacity at least `min_buffer_len`.
@@ -459,11 +464,16 @@ pub const ConnectionClient = struct {
 
     write_cipher: ?noise.CipherState = null,
     recv_cipher: ?noise.CipherState = null,
+    content_type: ContentType,
+
+    const PACKET_VERSION: u8 = 1;
+    pub const header_len = 4; // version(u8) + content type (u8) + len(u16)
 
     pub fn init(input: *std.Io.Reader, output: *std.Io.Writer, read_buffer: []u8, write_buffer: []u8) ConnectionClient {
         return .{
             .input = input,
             .output = output,
+            .content_type = .handshake,
             .reader = .{
                 .buffer = read_buffer,
                 .vtable = &.{
@@ -487,6 +497,7 @@ pub const ConnectionClient = struct {
         var conn = init(input, output, read_buffer, write_buffer);
         conn.recv_cipher = recv_cipher;
         conn.write_cipher = write_cipher;
+        conn.content_type = .application_data;
 
         return conn;
     }
@@ -517,15 +528,22 @@ pub const ConnectionClient = struct {
 
         log.debug("input buf: {any}", .{input.buffered()});
 
-        const packet_header = try input.peek(Packet.HEADER_LEN);
+        const packet_header = try input.peek(header_len);
         const packet_version = std.mem.readInt(u8, packet_header[0..1], .big);
-        const packet_size = std.mem.readInt(u16, packet_header[1..3], .big);
-        const packet_end: u16 = if (c.recv_cipher != null) packet_size + Packet.HEADER_LEN + 16 else packet_size + Packet.HEADER_LEN;
+        const packet_content_type: ContentType = @enumFromInt(std.mem.readInt(u8, packet_header[1..2], .big));
+        const packet_size = std.mem.readInt(u16, packet_header[2..4], .big);
+        const packet_end: u16 = if (c.recv_cipher != null) packet_size + header_len + 16 else packet_size + header_len;
 
-        log.debug("peeked (version={d}, size={d}, end={d}) {any}", .{ packet_version, packet_size, packet_end, packet_header });
+        log.debug("peeked (version={d}, type={} size={d}, end={d}) {any}", .{ packet_version, packet_content_type, packet_size, packet_end, packet_header });
         log.debug("buffer: {any}", .{input.buffered()});
 
-        if (packet_version != 1) {
+        if (packet_version != PACKET_VERSION) {
+            return error.ReadFailed;
+        }
+
+        if (packet_content_type != c.content_type) {
+            // TODO: set inner error maybe
+            log.debug("Invalid content type (recv={}, excpected={})", .{ packet_content_type, c.content_type });
             return error.ReadFailed;
         }
 
@@ -540,8 +558,8 @@ pub const ConnectionClient = struct {
         log.debug("prepped buffer: {any}", .{input.buffered()});
 
         rebase(r, packet_end);
-        input.toss(Packet.HEADER_LEN); // already peaked
-        const packet_buffer = try input.take(packet_end - Packet.HEADER_LEN); // actual packet
+        input.toss(header_len); // already peaked
+        const packet_buffer = try input.take(packet_end - header_len); // actual packet
 
         if (c.recv_cipher != null) {
             _ = c.recv_cipher.?.decryptWithAd(r.buffer[r.end..], "", packet_buffer) catch {
@@ -616,7 +634,8 @@ pub const ConnectionClient = struct {
 
     fn writePacket(c: *ConnectionClient, output: []u8, data: []const u8) !struct { usize, usize } {
         var writer = std.Io.Writer.fixed(output);
-        try writer.writeInt(u8, 1, .big); // version always set to 1
+        try writer.writeInt(u8, PACKET_VERSION, .big); // version always set to 1
+        try writer.writeInt(u8, @intFromEnum(c.content_type), .big);
         try writer.writeInt(u16, @intCast(data.len), .big);
 
         if (c.write_cipher != null) {
