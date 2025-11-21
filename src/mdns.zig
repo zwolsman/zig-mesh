@@ -1,3 +1,4 @@
+// Inspired by https://github.com/diogok/je-dns/tree/main
 const std = @import("std");
 const builtin = @import("builtin");
 
@@ -6,15 +7,19 @@ const zio = @import("zio");
 /// Query to find all local network services.
 const mdns_services_query = "_services._dns-sd._udp.local";
 /// Resource Type for local network services.
-// pub const mdns_services_resource_type: ResourceType = .PTR;
+const mdns_services_resource_type: ResourceType = .PTR;
 
 /// Multicast IPv6 Address for mDNS.
 const mdns_ipv6_address = zio.net.Address.fromStd(std.net.Address.initIp6([16]u8{ 0xff, 0x02, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0xfb }, 5353, 0, 0));
+
 /// Multicast IPv4 Address for mDNS.
 const mdns_ipv4_address = zio.net.Address.fromStd(std.net.Address.parseIp("224.0.0.251", 5353) catch unreachable); //std.net.Address.initIp4([4]u8{ 224, 0, 0, 251 }, 5353));
 
 /// Max size of a DNS name, like a full host.
 const NAME_MAX_SIZE = 253;
+
+/// Max size of a hostname.
+const HOST_NAME_MAX = 64;
 
 /// Size of a UDP packet.
 const PACKET_SIZE = 512;
@@ -231,9 +236,9 @@ const Record = struct {
 
         const name = try readNameBuffer(buffer[0..NAME_MAX_SIZE], reader);
 
-        const r_type = try reader.readInt(u16, .big);
-        const r_class = try reader.readInt(u16, .big);
-        const ttl = try reader.readInt(u32, .big);
+        const r_type = try reader.takeInt(u16, .big);
+        const r_class = try reader.takeInt(u16, .big);
+        const ttl = try reader.takeInt(u32, .big);
 
         const resource_type: ResourceType = @enumFromInt(r_type);
         const resource_class: ResourceClass = @enumFromInt(r_class & 0b1);
@@ -278,23 +283,22 @@ const RecordData = union(enum) {
     pub fn read(buffer: []u8, resource_type: ResourceType, reader: *std.Io.Reader) !RecordData {
 
         // Make sure we leave the stream at the end of the data.
-        const data_len = try reader.readInt(u16, .big);
+        const data_len = try reader.takeInt(u16, .big);
         const pos = reader.seek;
-        defer reader.end = data_len + pos;
 
-        const len = @min(data_len, buffer.len); // questionable...
+        const len = data_len;
         std.debug.assert(buffer.len >= len);
 
         switch (resource_type) {
             .A => {
-                var bytes: [4]u8 = undefined;
-                _ = try reader.read(&bytes);
-                return .{ .ip = std.net.Address.initIp4(bytes, 0) };
+                const bytes = try reader.takeArray(4);
+
+                return .{ .ip = std.net.Address.initIp4(bytes.*, 0) };
             },
             .AAAA => {
-                var bytes: [16]u8 = undefined;
-                _ = try reader.read(&bytes);
-                return .{ .ip = std.net.Address.initIp6(bytes, 0, 0, 0) };
+                const bytes = try reader.takeArray(16);
+
+                return .{ .ip = std.net.Address.initIp6(bytes.*, 0, 0, 0) };
             },
             .PTR => {
                 return .{ .ptr = try readNameBuffer(buffer, reader) };
@@ -302,24 +306,27 @@ const RecordData = union(enum) {
             .SRV => {
                 return .{
                     .srv = SRV{
-                        .weight = try reader.readInt(u16, .big),
-                        .priority = try reader.readInt(u16, .big),
-                        .port = try reader.readInt(u16, .big),
+                        .weight = try reader.takeInt(u16, .big),
+                        .priority = try reader.takeInt(u16, .big),
+                        .port = try reader.takeInt(u16, .big),
                         .target = try readNameBuffer(buffer, reader),
                     },
                 };
             },
             .TXT => {
-                const data = buffer[0..len];
-                _ = try reader.read(data);
+                const data = try reader.take(len);
+
                 return .{ .txt = data };
             },
             else => {
-                const data = buffer[0..len];
-                _ = try reader.read(data);
+                const data = try reader.take(len);
+
                 return .{ .raw = data };
             },
         }
+
+        // assert that we read the complete message
+        std.debug.assert(reader.seek == pos + len);
     }
 
     /// Write the resource data to a stream.
@@ -430,17 +437,17 @@ fn readNameBuffer(buffer: []u8, reader: *std.Io.Reader) ![]const u8 {
     var seekBackTo: u64 = 0;
 
     while (true) {
-        const len = try reader.readByte();
+        const len = try reader.takeByte();
         if (len == 0) { // if len is zero, there is no more data
             break;
         } else if (len >= 192) { // a length starting with 0b11 is a pointer
             const ptr0: u8 = len & 0b00111111; // remove the points bits to get the
-            const ptr1: u8 = try reader.readByte(); // the following byte is part of the pointer
+            const ptr1: u8 = try reader.takeByte(); // the following byte is part of the pointer
             // Join the two bytes to get the address of the rest of the name
             const ptr = (@as(u16, ptr0) << 8) + @as(u16, ptr1);
             // save current position
             if (seekBackTo == 0) {
-                seekBackTo = try reader.seek;
+                seekBackTo = reader.seek;
             }
             reader.seek = ptr;
         } else {
@@ -449,9 +456,12 @@ fn readNameBuffer(buffer: []u8, reader: *std.Io.Reader) ![]const u8 {
                 buffer[name_len] = '.';
                 name_len += 1;
             }
+
             // read the sepecificed len
-            const increase = try reader.read(buffer[name_len .. name_len + len]);
-            name_len += increase;
+            const data = try reader.take(len);
+
+            @memcpy(buffer[name_len .. name_len + len], data);
+            name_len += len;
         }
     }
 
@@ -471,18 +481,53 @@ pub const Service = struct {
 pub const mDNSService = struct {
     const log = std.log.scoped(.mdns);
 
-    sockets: [1]zio.net.Socket,
+    const BroadcastSocket = struct {
+        address: zio.net.Address,
+        socket: zio.net.Socket,
+    };
+    sockets: [1]BroadcastSocket,
     service: Service,
 
+    /// Internal buffers
+    name_buffer: [NAME_MAX_SIZE]u8 = undefined,
+    /// Internal buffers
+    host_buffer: [NAME_MAX_SIZE]u8 = undefined,
+    /// Internal buffers
+    hostname_buffer: [NAME_MAX_SIZE]u8 = undefined,
+    /// Internal buffers
+    service_name_buffer: [NAME_MAX_SIZE]u8 = undefined,
+    /// Internal buffers
+    target_buffer: [NAME_MAX_SIZE]u8 = undefined,
+    /// Internal buffers
+    addresses_buffer: [32]std.net.Address = undefined,
+
     pub fn init(rt: *zio.Runtime, service: Service) !mDNSService {
-        const ipv4_socket = try mdns_ipv4_address.ip.bind(rt);
-        try ipv4_socket.setReuseAddress(true);
-        try ipv4_socket.setReusePort(true);
+        // _ = rt;
+        const flags: u32 = std.posix.SOCK.DGRAM | std.posix.SOCK.CLOEXEC | std.posix.SOCK.NONBLOCK;
+        const sock_fd = try std.posix.socket(mdns_ipv4_address.ip.any.family, flags, 0);
+
+        var socket = zio.net.Socket{
+            .address = mdns_ipv4_address,
+            .handle = sock_fd,
+        };
+        try socket.setReuseAddress(true);
+        try socket.setReusePort(true);
+
+        const local_addr = std.net.Address.initIp4([4]u8{ 0, 0, 0, 0 }, 5353);
+
+        try socket.bind(rt, zio.net.Address.fromStd(local_addr));
+        // try std.posix.bind(sock, &local_addr.any, local_addr.getOsSockLen());
+        try setupMulticast(sock_fd, mdns_ipv4_address.toStd(), .{});
 
         return .{
-            .sockets = [1]zio.net.Socket{ipv4_socket},
+            .sockets = [1]BroadcastSocket{.{ .address = mdns_ipv4_address, .socket = socket }},
             .service = service,
         };
+    }
+
+    pub fn shutdown(self: *mDNSService, rt: *zio.Runtime) void {
+        _ = self; // autofix
+        _ = rt; // autofix
     }
 
     pub fn deinit(self: *mDNSService) void {
@@ -509,28 +554,33 @@ pub const mDNSService = struct {
         try question.writeTo(&writer);
 
         for (self.sockets) |s| {
-            _ = s.send(rt, writer.buffered()) catch |err| {
+            const len = s.socket.sendTo(rt, s.address, writer.buffered()) catch |err| {
                 log.debug("Could not send to {f}: {}", .{ s.address, err });
                 continue;
             };
+
+            log.debug("Wrote {} bytes to socket: {any}", .{ len, writer.buffered() });
         }
     }
 
     pub fn run(self: *mDNSService, rt: *zio.Runtime) !void {
         for (self.sockets) |s| {
-            var task = try rt.spawn(receive, .{ rt, s }, .{});
+            var task = try rt.spawn(receive, .{ self, rt, s.socket }, .{});
             task.detach(rt);
         }
     }
 
-    fn receive(rt: *zio.Runtime, socket: zio.net.Socket) void {
+    fn receive(self: *mDNSService, rt: *zio.Runtime, socket: zio.net.Socket) void {
         log.debug("Listening on: {f}", .{socket.address});
+        defer log.warn("Stopped listening on {f}!", .{socket.address});
+
         var buffer: [PACKET_SIZE]u8 = undefined;
-        while (true) {
+        while (!rt.shutting_down.raw) {
             const result = socket.receiveFrom(rt, &buffer) catch |err| {
                 log.debug("Err receiving: {}", .{err});
                 continue;
             };
+
             if (result.len == 0) break;
 
             var reader = std.Io.Reader.fixed(buffer[0..result.len]);
@@ -539,27 +589,83 @@ pub const mDNSService = struct {
                 continue;
             };
 
-            log.debug("Received message ({f}): {}", .{ result.from, message_reader.header });
+            log.debug("Received message ({f}): {}", .{ result.from, message_reader.header.flags.query_or_reply });
 
             switch (message_reader.header.flags.query_or_reply) {
-                .query => handleQuery(&message_reader),
-                .reply => handleReply(&message_reader),
+                .query => self.handleQuery(&message_reader) catch |err| {
+                    log.debug("Could not handle query: {}", .{err});
+                    continue;
+                },
+                .reply => self.handleReply(&message_reader) catch |err| {
+                    log.debug("Could not handle reply: {}", .{err});
+                    continue;
+                },
             }
         }
     }
 
-    fn handleQuery(reader: *MessageReader) void {
-        _ = reader; // autofix
+    fn handleQuery(self: *mDNSService, reader: *MessageReader) !void {
         log.debug("Received query", .{});
+        while (try reader.nextQuestion()) |q| {
+            if (std.mem.eql(u8, q.name, self.service.name)) {
+                log.debug("I have to respond!", .{});
+            } else {
+                log.debug("Not our service name: {s}", .{q.name});
+            }
+        }
     }
 
-    fn handleReply(reader: *MessageReader) void {
-        _ = reader; // autofix
+    fn handleReply(self: *mDNSService, reader: *MessageReader) !void {
         log.debug("Received reply", .{});
+
+        var peer: Peer = Peer{};
+
+        while (try reader.nextRecord()) |record| {
+            log.debug("Received {} resource", .{record.resource_type});
+            switch (record.resource_type) {
+                .PTR => {
+                    // PTR will have the a service instance
+                    // confirm this is the service we want
+                    if (std.mem.eql(u8, record.name, self.service.name)) {
+                        std.mem.copyForwards(u8, &self.name_buffer, record.data.ptr);
+                        peer.name = self.name_buffer[0..record.data.ptr.len];
+                        if (std.mem.eql(u8, peer.name, self.serviceName())) {
+                            // this is our own message
+                            // return null;
+                        }
+                        peer.ttl_in_seconds = record.ttl;
+                    } else {
+                        log.debug("Drop {s}", .{record.name});
+                    }
+                },
+                .TXT => {},
+                else => {},
+            }
+        }
+    }
+
+    fn serviceName(self: *@This()) []const u8 {
+        // Get our own hostname
+        _ = std.c.gethostname(&self.hostname_buffer, HOST_NAME_MAX);
+        const hostname = std.mem.span(@as([*c]u8, &self.hostname_buffer));
+
+        // name of this service instance
+        const full_service_name = std.fmt.bufPrint(
+            &self.service_name_buffer,
+            "{s}.{s}",
+            .{
+                hostname,
+                self.service.name,
+            },
+        ) catch unreachable;
+
+        return full_service_name;
     }
 };
 
 const MessageReader = struct {
+    buffer: [PACKET_SIZE]u8 = undefined,
+
     reader: *std.Io.Reader,
     header: Header,
 
@@ -578,7 +684,7 @@ const MessageReader = struct {
     pub fn nextQuestion(self: *@This()) !?Question {
         if (self.q < self.header.number_of_questions) {
             self.q += 1;
-            return try .read(&self.buffer, &self.stream);
+            return try .read(&self.buffer, self.reader);
         } else {
             return null;
         }
@@ -590,9 +696,245 @@ const MessageReader = struct {
         const max = self.header.number_of_answers + self.header.number_of_additional_resource_records + self.header.number_of_authority_resource_records;
         if (self.r < max) {
             self.r += 1;
-            return try .read(&self.buffer, &self.stream);
+            return try .read(&self.buffer, self.reader);
         } else {
             return null;
         }
     }
 };
+
+/// Common options for Multicast setupts.
+pub const MulticastOptions = struct {
+    /// How many network hops can the message go.
+    /// 0 is only the original machine.
+    /// 1 is original machine + 1, which usually means your direct network (eth, wi-fi, vpn).
+    hops: u8 = 1,
+    /// Loop means the sender will receive it's own messages.
+    /// Useful to debug.
+    loop: bool = true,
+};
+
+/// Get the "any" address of any address.
+/// Example: "0.0.0.0" or "::"
+pub fn getAny(address: std.net.Address) !std.net.Address {
+    switch (address.any.family) {
+        std.posix.AF.INET => {
+            return std.net.Address.initIp4([4]u8{ 0, 0, 0, 0 }, address.getPort());
+        },
+        std.posix.AF.INET6 => {
+            return std.net.Address.initIp6(std.mem.zeroes([16]u8), address.getPort(), 0, 0);
+        },
+        else => {
+            return error.UnkownAddressFamily;
+        },
+    }
+}
+
+/// Setup multicast options, specially for using mDNS.
+/// Works for IPv4 and IPv6.
+/// Will setup: Multicast interface (IF), Loop, Hops and Membership.
+pub fn setupMulticast(
+    sock: std.posix.socket_t,
+    address: std.net.Address,
+    options: MulticastOptions,
+) !void {
+    switch (address.any.family) {
+        std.posix.AF.INET => {
+            const any = try getAny(address);
+            // Setup for multicast.
+            // For IPv4, you set the multicast interface to the 'any' address.
+
+            try std.posix.setsockopt(
+                sock,
+                IPV4,
+                IP_MULTICAST_IF,
+                std.mem.asBytes(&any.in.sa.addr),
+            );
+            // Should receive it's own messages
+            var loop: u1 = 0;
+            if (options.loop) {
+                loop = 1;
+            }
+            try std.posix.setsockopt(
+                sock,
+                IPV4,
+                IP_MULTICAST_LOOP,
+                &std.mem.toBytes(@as(c_int, loop)),
+            );
+            // How many 'hops' (ie.: network machines) it will cross.
+            // Set to 1 to use only on immediate network (own machine + 1).
+            try std.posix.setsockopt(
+                sock,
+                IPV4,
+                IP_MULTICAST_TTL,
+                &std.mem.toBytes(@as(c_int, options.hops)),
+            );
+
+            // This will add our address to receive messages on the multicast "any" address.
+            const membership = extern struct {
+                addr: u32,
+                any: u32,
+            }{
+                .addr = address.in.sa.addr,
+                .any = any.in.sa.addr,
+            };
+            try std.posix.setsockopt(
+                sock,
+                IPV4,
+                IP_ADD_MEMBERSHIP,
+                std.mem.asBytes(&membership),
+            );
+        },
+        std.posix.AF.INET6 => {
+            // Setup for multicast.
+            // For IPv6 you choose a network interface.
+            // 0 means default
+            // Should we loop and do all interfaces?
+            try std.posix.setsockopt(
+                sock,
+                IPV6,
+                IPV6_MULTICAST_IF,
+                &std.mem.toBytes(@as(c_int, 0)),
+            );
+            // How many 'hops' (ie.: network machines) it will cross.
+            // Set to 1 to use only on immediate network (own machine + 1).
+            try std.posix.setsockopt(
+                sock,
+                IPV6,
+                IPV6_MULTICAST_HOPS,
+                &std.mem.toBytes(@as(c_int, options.hops)),
+            );
+            // Should receive it's own messages
+            var loop: u1 = 0;
+            if (options.loop) {
+                loop = 1;
+            }
+            try std.posix.setsockopt(
+                sock,
+                IPV6,
+                IPV6_MULTICAST_LOOP,
+                &std.mem.toBytes(@as(c_int, loop)),
+            );
+
+            // Ipv6 Add membership to the default interface (0)
+            const membership = extern struct {
+                addr: [16]u8,
+                index: c_uint,
+            }{
+                .addr = address.in6.sa.addr,
+                .index = 0,
+            };
+            try std.posix.setsockopt(
+                sock,
+                IPV6,
+                IPV6_ADD_MEMBERSHIP,
+                std.mem.asBytes(&membership),
+            );
+        },
+        else => {
+            return error.UnkownAddressFamily;
+        },
+    }
+}
+
+const c = @cImport({
+    switch (builtin.os.tag) {
+        .windows => @cInclude("ws2tcpip.h"),
+        else => @cInclude("arpa/inet.h"),
+    }
+});
+
+const IPV4 = c.IPPROTO_IP;
+const IPV6 = c.IPPROTO_IPV6;
+
+const IP_MULTICAST_IF = c.IP_MULTICAST_IF;
+const IP_MULTICAST_TTL = c.IP_MULTICAST_TTL;
+const IP_MULTICAST_LOOP = c.IP_MULTICAST_LOOP;
+const IP_ADD_MEMBERSHIP = c.IP_ADD_MEMBERSHIP;
+
+const IPV6_MULTICAST_IF = c.IPV6_MULTICAST_IF;
+const IPV6_MULTICAST_HOPS = c.IPV6_MULTICAST_HOPS;
+const IPV6_MULTICAST_LOOP = c.IPV6_MULTICAST_LOOP;
+const IPV6_ADD_MEMBERSHIP = if (builtin.os.tag == .macos) c.IPV6_JOIN_GROUP else c.IPV6_ADD_MEMBERSHIP;
+
+/// This is another instance of our service in this network.
+pub const Peer = struct {
+    /// TTL in seconds of this DNS records.
+    ttl_in_seconds: u32 = 0,
+    /// addresses of this Peer.
+    addresses: []const std.net.Address = &[_]std.net.Address{},
+    /// full name of this instance.
+    name: []const u8 = "",
+
+    pub fn eql(self: @This(), other_peer: @This()) bool {
+        return std.mem.eql(u8, self.name, other_peer.name);
+    }
+};
+
+test "Write and read the same message" {
+    std.testing.log_level = .debug;
+    var buffer: [512]u8 = undefined;
+    var writer = std.Io.Writer.fixed(&buffer);
+
+    var header = Header{};
+    header.ID = 38749;
+    header.flags.recursion_available = true;
+    header.flags.recursion_desired = true;
+    header.number_of_questions = 1;
+    header.number_of_additional_resource_records = 2;
+    try header.writeTo(&writer);
+
+    const question = Question{
+        .name = "example_q.com",
+        .resource_type = .A,
+    };
+    try question.writeTo(&writer);
+
+    const record0 = Record{
+        .name = "example_0.com",
+        .resource_type = .A,
+        .resource_class = .IN,
+        .ttl = 16777472,
+        .data = RecordData{
+            .ip = std.net.Address.initIp4([4]u8{ 127, 0, 0, 1 }, 0),
+        },
+    };
+    try record0.writeTo(&writer);
+
+    const record1 = Record{
+        .name = "example_1.com",
+        .resource_type = .AAAA,
+        .resource_class = .IN,
+        .ttl = 16777472,
+        .data = RecordData{
+            .ip = std.net.Address.initIp6([16]u8{ 0xff, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1 }, 0, 0, 0),
+        },
+    };
+    try record1.writeTo(&writer);
+
+    const written = writer.buffered();
+    var reader = std.Io.Reader.fixed(written);
+
+    var message_reader = try MessageReader.init(&reader);
+
+    try std.testing.expectEqual(header, message_reader.header);
+
+    const read_question = (try message_reader.nextQuestion()).?;
+    try std.testing.expectEqualStrings(question.name, read_question.name);
+    try std.testing.expectEqual(question.resource_class, read_question.resource_class);
+    try std.testing.expectEqual(question.resource_type, read_question.resource_type);
+
+    const read_record0 = (try message_reader.nextRecord()).?;
+    try std.testing.expectEqualStrings(record0.name, read_record0.name);
+    try std.testing.expectEqual(record0.ttl, read_record0.ttl);
+    try std.testing.expectEqual(record0.resource_class, read_record0.resource_class);
+    try std.testing.expectEqual(record0.resource_type, read_record0.resource_type);
+    try std.testing.expect(record0.data.ip.eql(read_record0.data.ip));
+
+    const read_record1 = (try message_reader.nextRecord()).?;
+    try std.testing.expectEqualStrings(record1.name, read_record1.name);
+    try std.testing.expectEqual(record1.ttl, read_record1.ttl);
+    try std.testing.expectEqual(record1.resource_class, read_record1.resource_class);
+    try std.testing.expectEqual(record1.resource_type, read_record1.resource_type);
+    try std.testing.expect(record1.data.ip.eql(read_record1.data.ip));
+}

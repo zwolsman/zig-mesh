@@ -59,10 +59,6 @@ pub const Node = struct {
         // Spawn server task
         var server_task = try rt.spawn(Node.serverLoop, .{ node, rt }, .{});
         server_task.detach(rt);
-
-        // Spawn signal handler task
-        var signal_task = try rt.spawn(signalHandler, .{ node, rt }, .{});
-        signal_task.detach(rt);
     }
 
     pub fn getOrCreatePeer(node: *Node, rt: *zio.Runtime, address: std.net.Address) !?*Peer {
@@ -84,16 +80,6 @@ pub const Node = struct {
         }
     }
 
-    fn signalHandler(node: *Node, rt: *zio.Runtime) !void {
-        var sig = try zio.Signal.init(.interrupt);
-        defer sig.deinit();
-
-        try sig.wait(rt);
-
-        std.log.info("Received signal, initiating shutdown...", .{});
-        node.shutdown(rt);
-    }
-
     fn serverLoop(self: *Self, rt: *zio.Runtime) !void {
         const server = self.server orelse return error.NoServer;
 
@@ -109,7 +95,7 @@ pub const Node = struct {
         }
     }
 
-    fn shutdown(self: *Self, rt: *zio.Runtime) void {
+    pub fn shutdown(self: *Self, rt: *zio.Runtime) void {
         log.info("Shutting down gracefully...", .{});
 
         log.info("Closing peers (n={d})...", .{self.peer_store.address_peer.count()});

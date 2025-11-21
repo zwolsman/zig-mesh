@@ -1,4 +1,5 @@
 const std = @import("std");
+const builtin = @import("builtin");
 
 const flags = @import("flags");
 const zio = @import("zio");
@@ -51,20 +52,18 @@ pub fn main() !void {
 
     try node.bind(rt, address);
 
+    const service_name = try std.fmt.allocPrint(allocator, "_{x}._tcp.local", .{&node.id.public_key});
+    defer allocator.free(service_name);
+
     var node_job = try rt.spawn(Node.run, .{ &node, rt }, .{});
     node_job.detach(rt);
 
-    const service_name = try std.fmt.allocPrint(allocator, "tcp://{x}", .{&node.id.public_key});
-    defer allocator.free(service_name);
-
-    var mdns_service = try mdns.mDNSService.init(rt, .{ .name = service_name, .port = node.server.?.socket.address.ip.getPort() });
-    defer mdns_service.deinit();
-
-    var mdns_job = try rt.spawn(mdns.mDNSService.run, .{ &mdns_service, rt }, .{});
+    var mdns_job = try rt.spawn(startMdns, .{ rt, &node, service_name }, .{});
     mdns_job.detach(rt);
 
-    // try to query
-    try mdns_service.query(rt);
+    // // Spawn signal handler task
+    // var signal_task = try rt.spawn(signalHandler, .{ rt, &node, &mdns_job }, .{});
+    // signal_task.detach(rt);
 
     var bootstrap_job = try rt.spawn(bootstrapNode, .{ rt, &node, options.positional.trailing }, .{});
     bootstrap_job.detach(rt);
@@ -99,4 +98,36 @@ fn bootstrapNode(rt: *zio.Runtime, node: *Node, bootstrap_addresses: []const []c
     }
 
     std.log.debug("Finished bootstrapping", .{});
+}
+
+fn signalHandler(rt: *zio.Runtime, node: *Node, mdnsJob: *zio.JoinHandle(void)) !void {
+    var sig = try zio.Signal.init(.interrupt);
+    defer sig.deinit();
+
+    try sig.wait(rt);
+
+    std.log.info("Received signal, initiating shutdown...", .{});
+    node.shutdown(rt);
+
+    mdnsJob.cancel(rt);
+}
+
+fn startMdns(rt: *zio.Runtime, node: *Node, service_name: []const u8) void {
+    _ = service_name; // autofix
+    _ = node; // autofix
+    var mdns_service = mdns.mDNSService.init(rt, .{ .name = "_marv._tcp.local", .port = 6969 }) catch |err| {
+        std.log.debug("Could not init mdns: {}", .{err});
+        return;
+    };
+    defer mdns_service.deinit();
+
+    mdns_service.run(rt) catch |err| {
+        std.log.debug("Could not run mdns: {}", .{err});
+        return;
+    };
+
+    mdns_service.query(rt) catch |err| {
+        std.log.debug("Could not query mdns: {}", .{err});
+        return;
+    };
 }
