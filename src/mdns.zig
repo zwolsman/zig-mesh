@@ -287,6 +287,9 @@ const RecordData = union(enum) {
         const pos = reader.seek;
 
         const len = data_len;
+        if (buffer.len < len) {
+            std.log.warn("Buffer to small (blen={}, len={})", .{ buffer.len, len });
+        }
         std.debug.assert(buffer.len >= len);
 
         switch (resource_type) {
@@ -376,40 +379,6 @@ const SRV = struct {
     target: []const u8,
 };
 
-/// Details of RecordData for TXT type.
-const TXTIter = struct {
-    data: []const u8,
-    pos: usize = 0,
-
-    pub fn next(self: *@This()) ?[]const u8 {
-        if (self.pos >= self.data.len) {
-            return null;
-        }
-        const txt_len = self.data[self.pos];
-        self.pos += 1;
-        defer self.pos += txt_len;
-        return self.data[self.pos .. self.pos + txt_len];
-    }
-
-    pub fn toBytes(buffer: []u8, txt: []const []const u8) []const u8 {
-        var pos: usize = 0;
-        for (txt) |t| {
-            buffer[pos] = @truncate(t.len);
-            pos += 1;
-            std.mem.copyForwards(u8, buffer[pos..], t);
-            pos += t.len;
-        }
-        return buffer[0..pos];
-    }
-
-    pub fn calcSize(txt: []const []const u8) usize {
-        var pos: usize = 0;
-        for (txt) |t| {
-            pos += t.len + 1;
-        }
-    }
-};
-
 /// Writes a name in the format of DNS names.
 /// Each "section" (the parts excluding the ".") is written
 /// as first a byte with the length them the actual data.
@@ -472,6 +441,40 @@ fn readNameBuffer(buffer: []u8, reader: *std.Io.Reader) ![]const u8 {
     return buffer[0..name_len];
 }
 
+/// Details of RecordData for TXT type.
+const TXTIter = struct {
+    data: []const u8,
+    pos: usize = 0,
+
+    pub fn next(self: *@This()) ?[]const u8 {
+        if (self.pos >= self.data.len) {
+            return null;
+        }
+        const txt_len = self.data[self.pos];
+        self.pos += 1;
+        defer self.pos += txt_len;
+        return self.data[self.pos .. self.pos + txt_len];
+    }
+
+    pub fn toBytes(buffer: []u8, txt: []const []const u8) []const u8 {
+        var pos: usize = 0;
+        for (txt) |t| {
+            buffer[pos] = @truncate(t.len);
+            pos += 1;
+            std.mem.copyForwards(u8, buffer[pos..], t);
+            pos += t.len;
+        }
+        return buffer[0..pos];
+    }
+
+    pub fn calcSize(txt: []const []const u8) usize {
+        var pos: usize = 0;
+        for (txt) |t| {
+            pos += t.len + 1;
+        }
+    }
+};
+
 /// Our service definition.
 pub const Service = struct {
     name: []const u8,
@@ -486,12 +489,13 @@ pub const mDNSService = struct {
         socket: zio.net.Socket,
     };
     sockets: [1]BroadcastSocket,
-    service: Service,
+    service_name: []const u8,
+    address: []const u8, // TODO: make it more generic.
 
     /// Internal buffers
     name_buffer: [NAME_MAX_SIZE]u8 = undefined,
     /// Internal buffers
-    host_buffer: [NAME_MAX_SIZE]u8 = undefined,
+    id_buffer: [16]u8 = undefined,
     /// Internal buffers
     hostname_buffer: [NAME_MAX_SIZE]u8 = undefined,
     /// Internal buffers
@@ -501,7 +505,7 @@ pub const mDNSService = struct {
     /// Internal buffers
     addresses_buffer: [32]std.net.Address = undefined,
 
-    pub fn init(rt: *zio.Runtime, service: Service) !mDNSService {
+    pub fn init(rt: *zio.Runtime, service_name: []const u8, addresss: []const u8) !mDNSService {
         // _ = rt;
         const flags: u32 = std.posix.SOCK.DGRAM | std.posix.SOCK.CLOEXEC | std.posix.SOCK.NONBLOCK;
         const sock_fd = try std.posix.socket(mdns_ipv4_address.ip.any.family, flags, 0);
@@ -519,10 +523,17 @@ pub const mDNSService = struct {
         // try std.posix.bind(sock, &local_addr.any, local_addr.getOsSockLen());
         try setupMulticast(sock_fd, mdns_ipv4_address.toStd(), .{});
 
-        return .{
+        var svc = mDNSService{
             .sockets = [1]BroadcastSocket{.{ .address = mdns_ipv4_address, .socket = socket }},
-            .service = service,
+            .service_name = service_name,
+            .address = addresss,
         };
+
+        var rng = std.Random.DefaultPrng.init(@intCast(std.time.nanoTimestamp()));
+        rng.fill(&svc.id_buffer);
+
+        log.debug("mdns peer id: {x}", .{&svc.id_buffer});
+        return svc;
     }
 
     pub fn shutdown(self: *mDNSService, rt: *zio.Runtime) void {
@@ -535,7 +546,6 @@ pub const mDNSService = struct {
     }
 
     /// This will query the network for other instances of this service.
-    /// The next call to `handle` will probably return new peers.
     pub fn query(self: *mDNSService, rt: *zio.Runtime) !void {
         var buffer: [512]u8 = undefined;
         var writer = std.Io.Writer.fixed(&buffer);
@@ -548,7 +558,7 @@ pub const mDNSService = struct {
         try header.writeTo(&writer);
 
         const question = Question{
-            .name = self.service.name,
+            .name = self.service_name,
             .resource_type = .PTR,
         };
         try question.writeTo(&writer);
@@ -589,10 +599,10 @@ pub const mDNSService = struct {
                 continue;
             };
 
-            log.debug("Received message ({f}): {}", .{ result.from, message_reader.header.flags.query_or_reply });
+            // log.debug("Received message ({f}): {}", .{ result.from, message_reader.header.flags.query_or_reply });
 
             switch (message_reader.header.flags.query_or_reply) {
-                .query => self.handleQuery(&message_reader) catch |err| {
+                .query => self.handleQuery(rt, &message_reader) catch |err| {
                     log.debug("Could not handle query: {}", .{err});
                     continue;
                 },
@@ -604,58 +614,112 @@ pub const mDNSService = struct {
         }
     }
 
-    fn handleQuery(self: *mDNSService, reader: *MessageReader) !void {
-        log.debug("Received query", .{});
+    fn handleQuery(self: *mDNSService, rt: *zio.Runtime, reader: *MessageReader) !void {
+        // log.debug("Received query", .{});
         while (try reader.nextQuestion()) |q| {
-            if (std.mem.eql(u8, q.name, self.service.name)) {
-                log.debug("I have to respond!", .{});
-            } else {
-                log.debug("Not our service name: {s}", .{q.name});
+            if (!std.mem.eql(u8, q.name, self.service_name)) {
+                continue;
+            }
+
+            var buffer: [PACKET_SIZE]u8 = undefined;
+            var writer = std.Io.Writer.fixed(&buffer);
+
+            // prepare basic header info
+            const header = Header{
+                .flags = Flags{
+                    .query_or_reply = .reply,
+                },
+                .number_of_answers = 1,
+                .number_of_additional_resource_records = 1,
+            };
+            try header.writeTo(&writer);
+
+            // Send our service full name
+            var record = Record{
+                .name = self.service_name,
+                .resource_type = .PTR,
+                .ttl = 600,
+                .data = .{
+                    .ptr = self.serviceName(),
+                },
+            };
+            try record.writeTo(&writer);
+
+            // TODO: clean up
+            var txt_buffer: [256]u8 = undefined;
+            const txt_data = try std.fmt.bufPrint(self.service_name_buffer[0..], "dnsaddr={s}", .{self.address});
+            const d = TXTIter.toBytes(
+                &txt_buffer,
+                &[_][]const u8{txt_data},
+            );
+
+            // Send the port and host
+            record = Record{
+                .name = self.serviceName(),
+                .resource_type = .TXT,
+                .ttl = 600,
+                .data = .{ .txt = d },
+            };
+
+            try record.writeTo(&writer);
+
+            for (self.sockets) |s| {
+                const len = s.socket.sendTo(rt, s.address, writer.buffered()) catch |err| {
+                    log.debug("Could not send to {f}: {}", .{ s.address, err });
+                    continue;
+                };
+
+                log.debug("Wrote {} bytes to socket ({f}): {any}", .{ len, s.socket.address, writer.buffered() });
             }
         }
     }
 
     fn handleReply(self: *mDNSService, reader: *MessageReader) !void {
-        log.debug("Received reply", .{});
-
         var peer: Peer = Peer{};
 
         while (try reader.nextRecord()) |record| {
-            log.debug("Received {} resource", .{record.resource_type});
             switch (record.resource_type) {
                 .PTR => {
                     // PTR will have the a service instance
                     // confirm this is the service we want
-                    if (std.mem.eql(u8, record.name, self.service.name)) {
-                        std.mem.copyForwards(u8, &self.name_buffer, record.data.ptr);
-                        peer.name = self.name_buffer[0..record.data.ptr.len];
-                        if (std.mem.eql(u8, peer.name, self.serviceName())) {
-                            // this is our own message
-                            // return null;
-                        }
-                        peer.ttl_in_seconds = record.ttl;
+                    if (!std.mem.eql(u8, record.name, self.service_name)) {
+                        continue;
+                    }
+                    @memmove(self.name_buffer[0..record.data.ptr.len], record.data.ptr);
+
+                    peer.name = self.name_buffer[0..record.data.ptr.len];
+                    peer.ttl_in_seconds = record.ttl;
+
+                    if (std.mem.eql(u8, peer.name, self.serviceName())) {
+                        break;
                     } else {
-                        log.debug("Drop {s}", .{record.name});
+                        log.debug("Received peer: {s}", .{peer.name});
                     }
                 },
-                .TXT => {},
+                .TXT => {
+                    if (!std.mem.eql(u8, record.name, peer.name)) {
+                        continue;
+                    }
+
+                    var txt_iter = TXTIter{ .data = record.data.txt };
+
+                    while (txt_iter.next()) |txt| {
+                        log.debug("\tTXT: {s}", .{txt});
+                    }
+                },
                 else => {},
             }
         }
     }
 
     fn serviceName(self: *@This()) []const u8 {
-        // Get our own hostname
-        _ = std.c.gethostname(&self.hostname_buffer, HOST_NAME_MAX);
-        const hostname = std.mem.span(@as([*c]u8, &self.hostname_buffer));
-
         // name of this service instance
         const full_service_name = std.fmt.bufPrint(
             &self.service_name_buffer,
-            "{s}.{s}",
+            "{x}.{s}",
             .{
-                hostname,
-                self.service.name,
+                self.id_buffer,
+                self.service_name,
             },
         ) catch unreachable;
 
@@ -664,7 +728,7 @@ pub const mDNSService = struct {
 };
 
 const MessageReader = struct {
-    buffer: [PACKET_SIZE]u8 = undefined,
+    buffer: [PACKET_SIZE * 2]u8 = undefined,
 
     reader: *std.Io.Reader,
     header: Header,

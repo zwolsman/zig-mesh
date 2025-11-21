@@ -52,18 +52,11 @@ pub fn main() !void {
 
     try node.bind(rt, address);
 
-    const service_name = try std.fmt.allocPrint(allocator, "_{x}._tcp.local", .{&node.id.public_key});
-    defer allocator.free(service_name);
-
     var node_job = try rt.spawn(Node.run, .{ &node, rt }, .{});
     node_job.detach(rt);
 
-    var mdns_job = try rt.spawn(startMdns, .{ rt, &node, service_name }, .{});
+    var mdns_job = try rt.spawn(startMdns, .{ rt, &node }, .{});
     mdns_job.detach(rt);
-
-    // // Spawn signal handler task
-    // var signal_task = try rt.spawn(signalHandler, .{ rt, &node, &mdns_job }, .{});
-    // signal_task.detach(rt);
 
     var bootstrap_job = try rt.spawn(bootstrapNode, .{ rt, &node, options.positional.trailing }, .{});
     bootstrap_job.detach(rt);
@@ -100,22 +93,13 @@ fn bootstrapNode(rt: *zio.Runtime, node: *Node, bootstrap_addresses: []const []c
     std.log.debug("Finished bootstrapping", .{});
 }
 
-fn signalHandler(rt: *zio.Runtime, node: *Node, mdnsJob: *zio.JoinHandle(void)) !void {
-    var sig = try zio.Signal.init(.interrupt);
-    defer sig.deinit();
+const serviceName = "z-mesh";
+fn startMdns(rt: *zio.Runtime, node: *Node) void {
+    var buf: [128]u8 = undefined;
 
-    try sig.wait(rt);
+    const addr = std.fmt.bufPrint(&buf, "tcp://{f}/", .{node.server.?.socket.address}) catch unreachable;
 
-    std.log.info("Received signal, initiating shutdown...", .{});
-    node.shutdown(rt);
-
-    mdnsJob.cancel(rt);
-}
-
-fn startMdns(rt: *zio.Runtime, node: *Node, service_name: []const u8) void {
-    _ = service_name; // autofix
-    _ = node; // autofix
-    var mdns_service = mdns.mDNSService.init(rt, .{ .name = "_marv._tcp.local", .port = 6969 }) catch |err| {
+    var mdns_service = mdns.mDNSService.init(rt, "_z-mesh._tcp.local", addr) catch |err| {
         std.log.debug("Could not init mdns: {}", .{err});
         return;
     };
