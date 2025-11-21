@@ -2,8 +2,10 @@ const std = @import("std");
 
 const zio = @import("zio");
 
-const Packet = @import("./packet.zig");
+const kamdelia = @import("kademlia.zig");
+const net = @import("net.zig");
 const noise = @import("noise.zig");
+const Packet = @import("packet.zig");
 
 const ID = struct {
     public_key: [32]u8,
@@ -24,6 +26,7 @@ pub const Node = struct {
     allocator: std.mem.Allocator,
     id: ID,
     peer_store: PeerStore,
+    routing_table: kamdelia.RoutingTable,
     server: ?zio.net.Server,
     kp: std.crypto.sign.Ed25519.KeyPair,
 
@@ -34,6 +37,9 @@ pub const Node = struct {
             .id = .{
                 .public_key = kp.public_key.toBytes(),
                 .address = null,
+            },
+            .routing_table = .{
+                .public_key = kp.public_key.toBytes(),
             },
             .peer_store = try .init(allocator),
             .server = null,
@@ -138,8 +144,15 @@ pub const Node = struct {
             return err;
         };
 
+        switch (self.routing_table.put(.{ .public_key = peer.id.public_key, .address = peer.stream.socket.address })) {
+            .full => log.info("Peer {x} registered (full)", .{&peer.id.public_key}),
+            .updated => log.info("Peer {x} registered (updated)", .{&peer.id.public_key}),
+            .inserted => log.info("Peer {x} registered (inserted)", .{&peer.id.public_key}),
+        }
+
         defer peer.close();
         defer self.peer_store.remove(peer) catch unreachable;
+        defer _ = self.routing_table.delete(peer.id.public_key);
 
         while (true) {
             const op, const tag = Packet.readPacket(&peer.conn.reader) catch |err| switch (err) {
@@ -361,36 +374,8 @@ pub const Peer = struct {
 
 const PeerStore = struct {
     const log = std.log.scoped(.peer_store);
-    address_peer: std.HashMap(zio.net.Address, *Peer, Context, std.hash_map.default_max_load_percentage),
+    address_peer: std.HashMap(zio.net.Address, *Peer, net.AddressContext, std.hash_map.default_max_load_percentage),
     key_peer: std.AutoHashMap([32]u8, *Peer),
-
-    const Context = struct {
-        pub fn hash(_: @This(), address: zio.net.Address) u64 {
-            var hasher = std.hash.Wyhash.init(0);
-
-            switch (address.any.family) {
-                std.posix.AF.INET => {
-                    hasher.update(std.mem.asBytes(&address.ip.in.addr));
-                    hasher.update(std.mem.asBytes(&address.ip.in.port));
-                },
-                std.posix.AF.INET6 => {
-                    hasher.update(std.mem.asBytes(&address.ip.in6.addr));
-                    hasher.update(std.mem.asBytes(&address.ip.in6.flowinfo));
-                    hasher.update(std.mem.asBytes(&address.ip.in6.scope_id));
-                    hasher.update(std.mem.asBytes(&address.ip.in6.port));
-                },
-                else => unreachable,
-            }
-            return hasher.final();
-        }
-
-        pub fn eql(_: @This(), a: zio.net.Address, b: zio.net.Address) bool {
-            if (a.any.family != b.any.family)
-                return false;
-
-            return a.toStd().eql(b.toStd());
-        }
-    };
 
     pub fn init(allocator: std.mem.Allocator) !PeerStore {
         return .{

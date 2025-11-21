@@ -1,5 +1,7 @@
 const std = @import("std");
 
+const zio = @import("zio");
+
 pub fn parseIpAddress(address: []const u8) !std.net.Address {
     const parsed = splitHostPort(address) catch |err| return switch (err) {
         error.DelimiterNotFound => std.net.Address.parseIp("127.0.0.1", try std.fmt.parseUnsigned(u16, address, 10)),
@@ -55,3 +57,30 @@ fn splitHostPort(address: []const u8) !HostPort {
 
     return HostPort{ .host = host, .port = port };
 }
+
+pub const AddressContext = struct {
+    pub fn hash(_: @This(), address: zio.net.Address) u64 {
+        var hasher = std.hash.Wyhash.init(0);
+
+        switch (address.any.family) {
+            std.posix.AF.INET => {
+                hasher.update(std.mem.asBytes(&address.ip.in.addr));
+                hasher.update(std.mem.asBytes(&address.ip.in.port));
+            },
+            std.posix.AF.INET6 => {
+                hasher.update(std.mem.asBytes(&address.ip.in6.addr));
+                hasher.update(std.mem.asBytes(&address.ip.in6.flowinfo));
+                hasher.update(std.mem.asBytes(&address.ip.in6.scope_id));
+                hasher.update(std.mem.asBytes(&address.ip.in6.port));
+            },
+            else => unreachable,
+        }
+        return hasher.final();
+    }
+
+    pub fn eql(_: @This(), a: zio.net.Address, b: zio.net.Address) bool {
+        if (a.any.family != b.any.family)
+            return false;
+        return a.toStd().eql(b.toStd());
+    }
+};
