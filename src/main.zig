@@ -14,6 +14,7 @@ const Flags = struct {
     seed: ?u256 = null,
     listen_address: ?[]const u8 = null,
     interactive: bool = false,
+    peer_discovery: bool = false,
     positional: struct {
         trailing: []const []const u8,
     },
@@ -55,8 +56,10 @@ pub fn main() !void {
     var node_job = try rt.spawn(Node.run, .{ &node, rt }, .{});
     node_job.detach(rt);
 
-    var mdns_job = try rt.spawn(startMdns, .{ rt, &node }, .{});
-    mdns_job.detach(rt);
+    if (options.peer_discovery) {
+        var mdns_job = try rt.spawn(startMdns, .{ rt, &node }, .{});
+        mdns_job.detach(rt);
+    }
 
     var bootstrap_job = try rt.spawn(bootstrapNode, .{ rt, &node, options.positional.trailing }, .{});
     bootstrap_job.detach(rt);
