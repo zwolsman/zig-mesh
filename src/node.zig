@@ -171,12 +171,17 @@ pub const Node = struct {
     }
 
     fn nodePacketHandler(node: *Node, peer: *Peer, op: Packet.Op, tag: Packet.Tag) !void {
-        _ = node; // autofix
-
         switch (op) {
             .command => switch (tag) {
                 .echo => |payload| {
                     log.debug("{f}: {s}", .{ peer.id, payload.message });
+                },
+                .route => |route| {
+                    if (std.mem.eql(u8, &node.id.public_key, &route.destination)) {
+                        log.debug("Received routed packet: {any}", .{route});
+                    } else {
+                        log.debug("Having to forward packet: {}", .{route});
+                    }
                 },
                 else => return error.UnexpectedOp,
             },
@@ -279,6 +284,9 @@ pub const Peer = struct {
 
             // Stage 2
             const remote_payload, _ = try state.read(&conn.reader);
+            if (remote_payload.len != std.crypto.sign.Ed25519.PublicKey.encoded_length + std.crypto.sign.Ed25519.Signature.encoded_length) {
+                return error.HandshakeFailed;
+            }
 
             const raw_pub = remote_payload[0..std.crypto.sign.Ed25519.PublicKey.encoded_length];
             const remote_pub = try std.crypto.sign.Ed25519.PublicKey.fromBytes(raw_pub.*);
@@ -326,8 +334,11 @@ pub const Peer = struct {
 
             // Stage 3
             const remote_payload, const chains = try state.read(&conn.reader);
+            if (remote_payload.len != std.crypto.sign.Ed25519.PublicKey.encoded_length + std.crypto.sign.Ed25519.Signature.encoded_length) {
+                return error.HandshakeFailed;
+            }
             if (chains == null) {
-                return error.InvalidHandshakeState;
+                return error.HandshakeFailed;
             }
 
             const raw_pub = remote_payload[0..std.crypto.sign.Ed25519.PublicKey.encoded_length];

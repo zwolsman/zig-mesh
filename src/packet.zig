@@ -1,6 +1,7 @@
 const std = @import("std");
 
 pub const ID = [16]u8;
+pub const Filter = @import("bloomfilter.zig").BloomFilter(16, 0.005);
 
 pub const OpType = enum {
     request,
@@ -17,11 +18,13 @@ pub const Op = union(OpType) {
 const PacketType = enum {
     ping,
     echo,
+    route,
 };
 
 pub const Tag = union(PacketType) {
     ping: void,
     echo: struct { message: []u8 },
+    route: struct { destination: [32]u8, payload: []const u8, mask: Filter.BitSet.MaskInt },
 };
 
 pub fn writePacket(writer: *std.Io.Writer, op: union(OpType) {
@@ -61,6 +64,12 @@ fn writeTag(writer: *std.Io.Writer, tag: Tag) !void {
             try writer.writeInt(u16, @intCast(payload.message.len), .big);
             try writer.writeAll(payload.message);
         },
+        .route => |route| {
+            try writer.writeAll(&route.destination);
+            try writer.writeInt(u16, @intCast(route.payload.len), .big);
+            try writer.writeAll(route.payload);
+            try writer.writeInt(Filter.BitSet.MaskInt, route.mask, .big);
+        },
     }
 }
 
@@ -85,6 +94,13 @@ pub fn readPacket(reader: *std.Io.Reader) !struct { Op, Tag } {
         .echo => {
             const msg_len = try reader.takeInt(u16, .big);
             break :read_tag Tag{ .echo = .{ .message = try reader.take(msg_len) } };
+        },
+        .route => {
+            const dest = try reader.takeArray(32);
+            const payload_len = try reader.takeInt(u16, .big);
+            const payload = try reader.take(payload_len);
+            const mask = try reader.takeInt(Filter.BitSet.MaskInt, .big);
+            break :read_tag Tag{ .route = .{ .destination = dest.*, .payload = payload, .mask = mask } };
         },
     };
 

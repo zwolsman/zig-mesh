@@ -6,7 +6,7 @@ const net = @import("net.zig");
 
 const PublicKey = [32]u8;
 
-const ID = struct {
+pub const ID = struct {
     public_key: PublicKey,
     address: zio.net.Address,
 
