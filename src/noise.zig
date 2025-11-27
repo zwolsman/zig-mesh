@@ -12,7 +12,7 @@ const PSK_SIZE = 32;
 /// The maximum `HASHLEN` that Noise hash functions output.
 pub const MAX_HASH_LEN = 64;
 
-const Role = enum { initiator, responder };
+pub const Role = enum { initiator, responder };
 
 const ChaCha20Poly1305CipherState = CipherStateT(std.crypto.aead.chacha_poly.ChaCha20Poly1305);
 const Aes256GcmCipherState = CipherStateT(std.crypto.aead.aes_gcm.Aes256Gcm);
@@ -192,6 +192,7 @@ const MessagePatternArray = struct {
 pub const CipherState = union(enum) {
     chacha: ChaCha20Poly1305CipherState,
     aesgcm: Aes256GcmCipherState,
+    empty,
 
     const nonce_length = 12;
 
@@ -218,6 +219,10 @@ pub const CipherState = union(enum) {
 
                 return self.aesgcm.encryptWithAd(ciphertext, ad, plaintext, nonce);
             },
+            .empty => {
+                @memcpy(ciphertext[0..plaintext.len], plaintext);
+                return ciphertext[0..plaintext.len];
+            },
         }
     }
 
@@ -237,6 +242,10 @@ pub const CipherState = union(enum) {
 
                 return self.aesgcm.decryptWithAd(plaintext, ad, ciphertext, nonce);
             },
+            .empty => {
+                @memcpy(plaintext[0..ciphertext.len], ciphertext);
+                return plaintext[0..ciphertext.len];
+            },
         }
     }
 
@@ -245,6 +254,7 @@ pub const CipherState = union(enum) {
         switch (self.*) {
             .chacha => return self.chacha.hasKey(),
             .aesgcm => return self.aesgcm.hasKey(),
+            .empty => return false,
         }
     }
 
@@ -252,6 +262,7 @@ pub const CipherState = union(enum) {
         return switch (self.*) {
             .chacha => try self.chacha.rekey(),
             .aesgcm => try self.aesgcm.rekey(),
+            .empty => {},
         };
     }
 };
@@ -401,8 +412,8 @@ test "cipherstate consistency" {
             const allocator = std.testing.allocator;
 
             const key = [_]u8{69} ** 32;
-            var sender = try CipherState.init(cipher, key);
-            var receiver = try CipherState.init(cipher, key);
+            var sender = CipherState.init(cipher, key);
+            var receiver = CipherState.init(cipher, key);
             const m = "Ladies and Gentlemen of the class of '99: If I could offer you only one tip for the future, sunscreen would be it.";
             const ad = "Additional data";
 
@@ -426,7 +437,7 @@ test "failed encryption returns plaintext" {
     const testCipher = struct {
         pub fn run(cipher: CipherChoice) !void {
             const key = [_]u8{0} ** 32;
-            var sender = try CipherState.init(cipher, key);
+            var sender = CipherState.init(cipher, key);
             const m = "Ladies and Gentlemen of the class of '99: If I could offer you only one tip for the future, sunscreen would be it.";
             const ad = "Additional data";
 
@@ -444,7 +455,7 @@ test "encryption fails on max nonce" {
     const testCipher = struct {
         pub fn run(cipher: CipherChoice) !void {
             const key = [_]u8{1} ** 32;
-            var sender = try CipherState.init(cipher, key);
+            var sender = CipherState.init(cipher, key);
 
             switch (cipher) {
                 .ChaChaPoly => sender.chacha.n = std.math.maxInt(u64),
@@ -466,7 +477,7 @@ test "rekey" {
             const allocator = std.testing.allocator;
 
             const key = [_]u8{1} ** 32;
-            var sender = try CipherState.init(cipher, key);
+            var sender = CipherState.init(cipher, key);
 
             const m = "Ladies and Gentlemen of the class of '99: If I could offer you only one tip for the future, sunscreen would be it.";
             const ad = "Additional data";
@@ -513,7 +524,7 @@ test "cipherState - encrypt aes" {
 test "CipherState - encrypt aes" {
     std.testing.log_level = .debug;
     const key: [std.crypto.aead.aes_gcm.Aes256Gcm.key_length]u8 = [_]u8{0x69} ** std.crypto.aead.aes_gcm.Aes256Gcm.key_length;
-    var s = try CipherState.init(.AESGCM, key);
+    var s = CipherState.init(.AESGCM, key);
 
     const m = "Test with message";
     const ad = "Test with associated data";

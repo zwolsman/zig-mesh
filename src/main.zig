@@ -6,9 +6,9 @@ const zio = @import("zio");
 
 const mdns = @import("./mdns.zig");
 const net = @import("./net.zig");
-const Node = @import("./node.zig").Node;
-const Packet = @import("./packet.zig");
 const Tty = @import("./tty.zig");
+const peer = @import("peer.zig");
+const protocol = @import("protocol.zig");
 
 const Flags = struct {
     seed: ?u256 = null,
@@ -45,15 +45,20 @@ pub fn main() !void {
     else
         std.crypto.sign.Ed25519.KeyPair.generate();
 
-    const seed = std.mem.bytesToValue(u256, &kp.secret_key.seed());
-    std.log.debug("seed: {d}", .{seed});
+    var node = try peer.Node.init(allocator, rt, .{ .full = kp });
+    // Set up event handlers
+    node.event_handler = .{
+        .onPeerConnectedFn = onPeerConnected,
+        .onMessageReceivedFn = onMessageReceived,
+        .onPeerDisconnectedFn = onPeerDisconnected,
+        .onErrorFn = onError,
+    };
 
-    var node = try Node.init(allocator, kp);
     defer node.deinit();
 
-    try node.bind(rt, address);
+    std.log.debug("peer id: {x}", .{&node.identity.publicKey()});
 
-    var node_job = try rt.spawn(Node.run, .{ &node, rt }, .{});
+    var node_job = try rt.spawn(peer.Node.start, .{ &node, address }, .{});
     node_job.detach(rt);
 
     if (options.peer_discovery) {
@@ -61,7 +66,7 @@ pub fn main() !void {
         mdns_job.detach(rt);
     }
 
-    var bootstrap_job = try rt.spawn(bootstrapNode, .{ rt, &node, options.positional.trailing }, .{});
+    var bootstrap_job = try rt.spawn(bootstrapNode, .{ &node, options.positional.trailing }, .{});
     bootstrap_job.detach(rt);
 
     if (options.interactive) {
@@ -72,7 +77,7 @@ pub fn main() !void {
     try rt.run();
 }
 
-fn bootstrapNode(rt: *zio.Runtime, node: *Node, bootstrap_addresses: []const []const u8) void {
+fn bootstrapNode(node: *peer.Node, bootstrap_addresses: []const []const u8) void {
     if (bootstrap_addresses.len == 0) return;
 
     for (bootstrap_addresses) |raw_address| {
@@ -81,15 +86,12 @@ fn bootstrapNode(rt: *zio.Runtime, node: *Node, bootstrap_addresses: []const []c
             continue;
         };
 
-        const peer = node.getOrCreatePeer(rt, addr) catch |err| {
+        const p = node.connect(addr) catch |err| {
             std.log.debug("Could not connect to peer {f}: {}", .{ addr, err });
-            continue;
-        } orelse {
-            std.log.debug("Could not find peer {f}", .{addr});
             continue;
         };
 
-        std.log.debug("Connected to bootstrap peer {f}", .{peer.id});
+        std.log.debug("Connected to bootstrap peer {x}", .{&p.id.publicKey()});
         // TODO: query bootstrap peer for their peers
     }
 
@@ -97,10 +99,10 @@ fn bootstrapNode(rt: *zio.Runtime, node: *Node, bootstrap_addresses: []const []c
 }
 
 const serviceName = "z-mesh";
-fn startMdns(rt: *zio.Runtime, node: *Node) void {
+fn startMdns(rt: *zio.Runtime, node: *peer.Node) void {
     var buf: [128]u8 = undefined;
 
-    const addr = std.fmt.bufPrint(&buf, "tcp://{f}/", .{node.server.?.socket.address}) catch unreachable;
+    const addr = std.fmt.bufPrint(&buf, "tcp://{f}/", .{node.transport.server.?.socket.address.ip}) catch unreachable;
 
     var mdns_service = mdns.mDNSService.init(rt, "_z-mesh._tcp.local", addr) catch |err| {
         std.log.debug("Could not init mdns: {}", .{err});
@@ -117,4 +119,20 @@ fn startMdns(rt: *zio.Runtime, node: *Node) void {
         std.log.debug("Could not query mdns: {}", .{err});
         return;
     };
+}
+
+fn onPeerConnected(conn: *peer.Connection) void {
+    std.debug.print("Peer connected: {x}\n", .{&conn.id.publicKey()});
+}
+
+fn onMessageReceived(peer_id: peer.Identity.PublicKey, op: protocol.Op, payload: protocol.Payload) void {
+    std.debug.print("Message from {x}: {any} {any}\n", .{ &peer_id, op, payload });
+}
+
+fn onPeerDisconnected(peer_id: peer.Identity.PublicKey) void {
+    std.debug.print("Peer disconnected: {x}\n", .{&peer_id});
+}
+
+fn onError(err: anyerror) void {
+    std.debug.print("Error: {}\n", .{err});
 }
