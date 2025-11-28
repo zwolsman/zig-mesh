@@ -79,17 +79,18 @@ pub const Node = struct {
     connections_mutex: std.Thread.Mutex = .{},
 
     transport: TCPTransport,
-    event_handler: PeerEventHandler = .{},
+    event_handler: *PeerEventHandler,
 
     accept_task: ?zio.JoinHandle(void) = null,
     running: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
 
-    pub fn init(allocator: std.mem.Allocator, rt: *zio.Runtime, identity: Identity) !Self {
+    pub fn init(allocator: std.mem.Allocator, rt: *zio.Runtime, identity: Identity, event_handler: *PeerEventHandler) !Self {
         return .{
             .allocator = allocator,
             .rt = rt,
 
             .identity = identity,
+            .event_handler = event_handler,
 
             .connections = .init(allocator),
             .transport = .{},
@@ -496,32 +497,34 @@ pub const Connection = struct {
 };
 
 pub const PeerEventHandler = struct {
-    onPeerConnectedFn: ?*const fn (*Connection) void = null,
-    onPeerDisconnectedFn: ?*const fn (Identity.PublicKey) void = null,
-    onMessageReceivedFn: ?*const fn (Identity.PublicKey, protocol.Op, protocol.Payload) void = null,
-    onErrorFn: ?*const fn (anyerror) void = null,
+    const Self = @This();
 
-    pub fn onPeerConnected(self: *const PeerEventHandler, connection: *Connection) void {
+    onPeerConnectedFn: ?*const fn (*Self, *Connection) void = null,
+    onPeerDisconnectedFn: ?*const fn (*Self, Identity.PublicKey) void = null,
+    onMessageReceivedFn: ?*const fn (*Self, Identity.PublicKey, protocol.Op, protocol.Payload) void = null,
+    onErrorFn: ?*const fn (*Self, anyerror) void = null,
+
+    pub fn onPeerConnected(self: *Self, connection: *Connection) void {
         if (self.onPeerConnectedFn) |callback| {
-            callback(connection);
+            callback(self, connection);
         }
     }
 
-    pub fn onPeerDisconnected(self: *const PeerEventHandler, peer_id: Identity.PublicKey) void {
+    pub fn onPeerDisconnected(self: *Self, peer_id: Identity.PublicKey) void {
         if (self.onPeerDisconnectedFn) |callback| {
-            callback(peer_id);
+            callback(self, peer_id);
         }
     }
 
-    pub fn onMessageReceived(self: *const PeerEventHandler, peer_id: Identity.PublicKey, op: protocol.Op, payload: protocol.Payload) void {
+    pub fn onMessageReceived(self: *Self, peer_id: Identity.PublicKey, op: protocol.Op, payload: protocol.Payload) void {
         if (self.onMessageReceivedFn) |callback| {
-            callback(peer_id, op, payload);
+            callback(self, peer_id, op, payload);
         }
     }
 
-    pub fn onError(self: *const PeerEventHandler, err: anyerror) void {
+    pub fn onError(self: *Self, err: anyerror) void {
         if (self.onErrorFn) |callback| {
-            callback(err);
+            callback(self, err);
         }
     }
 };
