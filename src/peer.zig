@@ -3,6 +3,7 @@ const Ed25519 = std.crypto.sign.Ed25519;
 
 const zio = @import("zio");
 
+const kademlia = @import("kademlia.zig");
 const noise = @import("noise.zig");
 const protocol = @import("protocol.zig");
 
@@ -24,7 +25,7 @@ pub const Identity = union(enum) {
         };
     }
 
-    fn initPublic(bytes: [32]u8) !Identity {
+    pub fn initPublic(bytes: [32]u8) !Identity {
         return .{
             .public = try Ed25519.PublicKey.fromBytes(bytes),
         };
@@ -159,6 +160,14 @@ pub const Node = struct {
         conn.receive_task = try self.rt.spawn(receiveLoop, .{ self, conn }, .{});
 
         return conn;
+    }
+
+    /// Send message to remote peer
+    pub fn sendMessage(self: *Self, destination: Identity, op: protocol.Encoder.WriteOp, tag: protocol.Payload) !void {
+        const conn = self.connections.get(destination.publicKey()) orelse return error.UnknownPeer;
+
+        _ = try conn.encoder.write(op, tag);
+        try conn.writer.interface.flush();
     }
 
     /// Accept loop (runs in background task)
@@ -494,6 +503,68 @@ pub const Connection = struct {
         self.state = .closing;
         // self.encoder.writeMessage(.close, "") catch {};
         self.state = .closed;
+    }
+};
+
+pub const RoutingNode = struct {
+    const Self = @This();
+    const log = std.log.scoped(.router);
+
+    base: *Node,
+    routing_table: kademlia.RoutingTable,
+    routing_mutex: std.Thread.Mutex = .{},
+
+    event_handler: PeerEventHandler = .{
+        .onPeerConnectedFn = onPeerConnected,
+        .onPeerDisconnectedFn = onPeerDisconnected,
+    },
+
+    pub fn init(node: *Node) Self {
+        return .{
+            .base = node,
+            .routing_table = .{
+                .public_key = node.identity.publicKey(),
+            },
+        };
+    }
+
+    /// start routing support by registering the event handler
+    pub fn start(self: *Self) !void {
+        try self.base.event_handler.register(&self.event_handler);
+    }
+
+    pub fn sendMessage(self: *Self, destination: Identity, op: protocol.Encoder.WriteOp, tag: protocol.Payload) !void {
+        self.base.sendMessage(destination, op, tag) catch |err| {
+            return switch (err) {
+                error.UnknownPeer => self.forwardMessage(destination, op, tag),
+                else => err,
+            };
+        };
+    }
+
+    fn forwardMessage(self: *Self, destination: Identity, op: protocol.Encoder.WriteOp, tag: protocol.Payload) !void {
+        _ = self;
+        log.debug("TODO: implement forwarding (dest={x}, op={any}, tag={any})", .{ &destination.publicKey(), op, tag });
+    }
+
+    fn onPeerConnected(h: *PeerEventHandler, conn: *Connection) void {
+        const self: *Self = @alignCast(@fieldParentPtr("event_handler", h));
+        self.routing_mutex.lock();
+        defer self.routing_mutex.unlock();
+
+        const result = self.routing_table.put(conn);
+
+        log.debug("routing table route {x} ({any})", .{ &conn.id.publicKey(), result });
+    }
+
+    fn onPeerDisconnected(h: *PeerEventHandler, peer_id: Identity.PublicKey) void {
+        const self: *Self = @alignCast(@fieldParentPtr("event_handler", h));
+        self.routing_mutex.lock();
+        defer self.routing_mutex.unlock();
+
+        if (self.routing_table.delete(peer_id)) {
+            log.debug("routing table route {x} (removed)", .{&peer_id});
+        }
     }
 };
 

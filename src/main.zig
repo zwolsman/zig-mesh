@@ -50,17 +50,15 @@ pub fn main() !void {
 
     // Set up event handlers
     var logging_event_handler = LoggingEventHandler.init();
-
-    var peer_event_handler = PeerEventHandler.init(allocator);
-    defer peer_event_handler.deinit();
-
     try node.event_handler.register(&logging_event_handler.interface);
-    try node.event_handler.register(&peer_event_handler.interface);
 
     std.log.debug("peer id: {x}", .{&node.identity.publicKey()});
 
     var node_job = try rt.spawn(peer.Node.start, .{ &node, address }, .{});
     node_job.detach(rt);
+
+    var router = peer.RoutingNode.init(&node);
+    try router.start();
 
     if (options.peer_discovery) {
         var mdns_job = try rt.spawn(startMdns, .{ rt, &node }, .{});
@@ -71,7 +69,7 @@ pub fn main() !void {
     bootstrap_job.detach(rt);
 
     if (options.interactive) {
-        var tty_job = try rt.spawn(Tty.run, .{ allocator, rt, &node }, .{});
+        var tty_job = try rt.spawn(Tty.run, .{ allocator, rt, &router }, .{});
         tty_job.detach(rt);
     }
 
@@ -138,66 +136,21 @@ const LoggingEventHandler = struct {
 
     fn onPeerConnected(h: *peer.PeerEventHandler, conn: *peer.Connection) void {
         _ = h;
-        std.debug.print("Peer connected: {x}\n", .{&conn.id.publicKey()});
+        std.log.info("Peer connected: {x}", .{&conn.id.publicKey()});
     }
 
     fn onMessageReceived(h: *peer.PeerEventHandler, peer_id: peer.Identity.PublicKey, op: protocol.Op, payload: protocol.Payload) void {
         _ = h;
-        std.debug.print("Message from {x}: {any} {any}\n", .{ &peer_id, op, payload });
+        std.log.info("Message from {x}: {any} {any}", .{ &peer_id, op, payload });
     }
 
     fn onPeerDisconnected(h: *peer.PeerEventHandler, peer_id: peer.Identity.PublicKey) void {
         _ = h;
-        std.debug.print("Peer disconnected: {x}\n", .{&peer_id});
+        std.log.info("Peer disconnected: {x}", .{&peer_id});
     }
 
     fn onError(h: *peer.PeerEventHandler, err: anyerror) void {
         _ = h;
-        std.debug.print("Error: {}\n", .{err});
-    }
-};
-
-const PeerEventHandler = struct {
-    const Self = @This();
-    interface: peer.PeerEventHandler,
-    peers: std.array_list.Managed(peer.Identity.PublicKey),
-
-    pub fn init(allocator: std.mem.Allocator) Self {
-        return .{
-            .peers = .init(allocator),
-            .interface = .{
-                .onPeerConnectedFn = onPeerConnected,
-                .onPeerDisconnectedFn = onPeerDisconnected,
-            },
-        };
-    }
-
-    pub fn deinit(self: *Self) void {
-        self.peers.deinit();
-    }
-
-    fn onPeerConnected(h: *peer.PeerEventHandler, conn: *peer.Connection) void {
-        const self: *Self = @alignCast(@fieldParentPtr("interface", h));
-        self.peers.append(conn.id.publicKey()) catch {};
-
-        self.printPeers();
-    }
-
-    fn onPeerDisconnected(h: *peer.PeerEventHandler, peer_id: peer.Identity.PublicKey) void {
-        const self: *Self = @alignCast(@fieldParentPtr("interface", h));
-        for (0.., self.peers.items) |i, p| {
-            if (std.mem.eql(u8, &p, &peer_id)) {
-                _ = self.peers.swapRemove(i);
-                break;
-            }
-        }
-        self.printPeers();
-    }
-
-    fn printPeers(self: *Self) void {
-        std.log.debug("Peers connected: {d}", .{self.peers.items.len});
-        for (self.peers.items) |p| {
-            std.log.debug("\t{x}", .{p});
-        }
+        std.log.warn("Error: {}", .{err});
     }
 };

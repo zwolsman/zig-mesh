@@ -198,7 +198,7 @@ pub const Encoder = struct {
     const Self = @This();
     const log = std.log.scoped(.encoder);
 
-    const WriteOp = union(OpTag) {
+    pub const WriteOp = union(OpTag) {
         request,
         response: [16]u8,
         command,

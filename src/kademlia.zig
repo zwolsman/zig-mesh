@@ -3,35 +3,20 @@ const std = @import("std");
 const zio = @import("zio");
 
 const net = @import("net.zig");
-
-const PublicKey = [32]u8;
-
-pub const ID = struct {
-    public_key: PublicKey,
-    address: zio.net.Address,
-
-    pub fn eql(self: @This(), other: @This()) bool {
-        return std.mem.eql(u8, &self.public_key, &other.public_key) and
-            self.address.toStd().eql(other.address.toStd());
-    }
-
-    pub fn format(self: @This(), writer: *std.Io.Writer) std.Io.Writer.Error!void {
-        try std.Io.Writer.print(writer, "{f}[{x}]", .{ self.address, &self.public_key });
-    }
-};
+const peer = @import("peer.zig");
 
 pub const RoutingTable = struct {
     const bucket_size = 16;
     const bucket_count = 256;
 
-    const Bucket = StaticRingBuffer(ID, u64, bucket_size);
+    const Bucket = StaticRingBuffer(peer.Identity.PublicKey, u64, bucket_size);
 
-    public_key: PublicKey,
+    public_key: peer.Identity.PublicKey,
     buckets: [bucket_count]Bucket = [_]Bucket{.{}} ** bucket_count,
-    addresses: StaticHashMap(zio.net.Address, ID, net.AddressContext, bucket_count * bucket_size) = .{},
+    connections: StaticHashMap(*peer.Connection, peer.Identity.PublicKey, std.hash_map.AutoContext(*peer.Connection), bucket_count * bucket_size) = .{},
     len: usize = 0,
 
-    fn clz(public_key: PublicKey) usize {
+    fn clz(public_key: peer.Identity.PublicKey) usize {
         comptime var i = 0;
         inline while (i < 32) : (i += 1) {
             if (public_key[i] != 0) {
@@ -41,8 +26,8 @@ pub const RoutingTable = struct {
         return 256;
     }
 
-    fn xor(a: PublicKey, b: PublicKey) PublicKey {
-        return @as(PublicKey, @as(@Vector(32, u8), a) ^ @as(@Vector(32, u8), b));
+    fn xor(a: peer.Identity.PublicKey, b: peer.Identity.PublicKey) peer.Identity.PublicKey {
+        return @as(peer.Identity.PublicKey, @as(@Vector(32, u8), a) ^ @as(@Vector(32, u8), b));
     }
 
     const PutResult = enum {
@@ -51,12 +36,12 @@ pub const RoutingTable = struct {
         inserted,
     };
 
-    fn removeFromBucket(bucket: *Bucket, public_key: PublicKey) bool {
+    fn removeFromBucket(bucket: *Bucket, public_key: peer.Identity.PublicKey) bool {
         var i: usize = bucket.head;
         var j: usize = bucket.head;
         while (i != bucket.tail) : (i -%= 1) {
             const it = bucket.entries[(i -% 1) & (bucket_size - 1)];
-            if (!std.mem.eql(u8, &it.public_key, &public_key)) {
+            if (!std.mem.eql(u8, &it, &public_key)) {
                 bucket.entries[(j -% 1) & (bucket_size - 1)] = it;
                 j -%= 1;
             }
@@ -68,28 +53,28 @@ pub const RoutingTable = struct {
         return i != j;
     }
 
-    pub fn put(self: *RoutingTable, id: ID) PutResult {
-        if (std.mem.eql(u8, &self.public_key, &id.public_key)) {
+    pub fn put(self: *RoutingTable, conn: *peer.Connection) PutResult {
+        if (std.mem.eql(u8, &self.public_key, &conn.id.publicKey())) {
             return .full;
         }
 
-        const bucket = &self.buckets[clz(xor(self.public_key, id.public_key))];
+        const bucket = &self.buckets[clz(xor(self.public_key, conn.id.publicKey()))];
 
-        const result = self.addresses.getOrPutAssumeCapacity(id.address);
+        const result = self.connections.getOrPutAssumeCapacity(conn);
         const removed = removed: {
             if (result.found_existing) {
-                const other_bucket = &self.buckets[clz(xor(self.public_key, result.value_ptr.public_key))];
-                break :removed removeFromBucket(other_bucket, result.value_ptr.public_key);
+                const other_bucket = &self.buckets[clz(xor(self.public_key, result.value_ptr.*))];
+                break :removed removeFromBucket(other_bucket, result.value_ptr.*);
             }
-            break :removed removeFromBucket(bucket, id.public_key);
+            break :removed removeFromBucket(bucket, conn.id.publicKey());
         };
-        result.value_ptr.* = id;
+        result.value_ptr.* = conn.id.publicKey();
 
         if (!removed and bucket.count() == bucket_size) {
             return .full;
         }
 
-        bucket.push(id);
+        bucket.push(conn.id.publicKey());
 
         if (removed) {
             return .updated;
@@ -99,7 +84,7 @@ pub const RoutingTable = struct {
         return .inserted;
     }
 
-    pub fn delete(self: *RoutingTable, public_key: PublicKey) bool {
+    pub fn delete(self: *RoutingTable, public_key: peer.Identity.PublicKey) bool {
         if (self.len == 0 or std.mem.eql(u8, &self.public_key, &public_key)) {
             return false;
         }
@@ -113,21 +98,21 @@ pub const RoutingTable = struct {
         return true;
     }
 
-    pub fn get(self: *const RoutingTable, public_key: PublicKey) ?ID {
+    pub fn get(self: *const RoutingTable, public_key: peer.Identity.PublicKey) ?*peer.Connection {
         const bucket_index = clz(xor(self.public_key, public_key));
         const bucket = self.buckets[bucket_index];
 
         var i: usize = bucket.head;
         while (i != bucket.tail) : (i -%= 1) {
             const it = bucket.entries[(i -% 1) & (bucket_size - 1)];
-            if (std.mem.eql(u8, &it.public_key, &public_key))
+            if (std.mem.eql(u8, &it, &public_key))
                 return it;
         }
 
         return null;
     }
 
-    pub fn closestTo(self: *const RoutingTable, dst: []ID, public_key: PublicKey) usize {
+    pub fn closestTo(self: *const RoutingTable, dst: []*peer.Connection, public_key: peer.Identity.PublicKey) usize {
         var count: usize = 0;
 
         const bucket_index = clz(xor(self.public_key, public_key));
@@ -159,7 +144,7 @@ pub const RoutingTable = struct {
         not_found: usize,
     };
 
-    fn binarySearch(our_public_key: PublicKey, slice: []ID, public_key: PublicKey) BinarySearchResult {
+    fn binarySearch(our_public_key: peer.Identity.PublicKey, slice: []*peer.Connection, public_key: peer.Identity.PublicKey) BinarySearchResult {
         var size: usize = slice.len;
         var left: usize = 0;
         var right: usize = slice.len;
@@ -179,13 +164,13 @@ pub const RoutingTable = struct {
         return .{ .not_found = left };
     }
 
-    fn fillSort(self: *const RoutingTable, dst: []ID, count: *usize, public_key: PublicKey, bucket_index: usize) void {
+    fn fillSort(self: *const RoutingTable, dst: []*peer.Connection, count: *usize, public_key: peer.Identity.PublicKey, bucket_index: usize) void {
         const bucket = &self.buckets[bucket_index];
 
         var i: usize = bucket.head;
         while (i != bucket.tail) : (i -%= 1) {
             const it = bucket.entries[(i -% 1) & (bucket_size - 1)];
-            if (!std.mem.eql(u8, &it.public_key, &public_key)) {
+            if (!std.mem.eql(u8, &it, &public_key)) {
                 const result = binarySearch(self.public_key, dst[0..count.*], it.public_key);
                 std.debug.assert(result != .found);
 

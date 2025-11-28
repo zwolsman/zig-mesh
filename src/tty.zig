@@ -9,7 +9,7 @@ const log = std.log.scoped(.tty);
 
 const Tokens = std.mem.TokenIterator(u8, .scalar);
 
-pub fn run(allocator: std.mem.Allocator, rt: *zio.Runtime, node: *peer.Node) !void {
+pub fn run(allocator: std.mem.Allocator, rt: *zio.Runtime, router: *peer.RoutingNode) !void {
     log.debug("Waiting for command..", .{});
     var in = zio.Pipe.init(std.fs.File.stdin());
 
@@ -33,23 +33,23 @@ pub fn run(allocator: std.mem.Allocator, rt: *zio.Runtime, node: *peer.Node) !vo
         if (std.mem.eql(u8, upper_cmd, "HELP")) {
             std.debug.print("There is no help, figure it out yoruself\n", .{});
         } else if (std.mem.eql(u8, upper_cmd, "PEERS")) {
-            std.debug.print("{} peer(s) connected\n", .{node.connections.count()});
-            var it = node.connections.valueIterator();
+            std.debug.print("{} peer(s) connected\n", .{router.base.connections.count()});
+            var it = router.base.connections.valueIterator();
             while (it.next()) |p| {
                 std.debug.print("  {x}\n", .{&p.*.id.publicKey()});
             }
         } else if (std.mem.eql(u8, upper_cmd, "ID")) {
-            std.debug.print("{x}\n", .{&node.identity.publicKey()});
+            std.debug.print("{x}\n", .{&router.base.identity.publicKey()});
         } else if (std.mem.eql(u8, upper_cmd, "CONNECT")) {
-            handleConnect(allocator, rt, node, &tokens) catch |err| {
+            handleConnect(allocator, rt, router.base, &tokens) catch |err| {
                 log.warn("Could not handle connect command: {}", .{err});
             };
         } else if (std.mem.eql(u8, upper_cmd, "ECHO")) {
-            handleEcho(allocator, rt, node, &tokens) catch |err| {
+            handleEcho(allocator, rt, router, &tokens) catch |err| {
                 log.warn("Could not handle echo command: {}", .{err});
             };
         } else if (std.mem.eql(u8, upper_cmd, "PING")) {
-            handlePing(allocator, rt, node, &tokens) catch |err| {
+            handlePing(allocator, rt, router, &tokens) catch |err| {
                 log.warn("Could not handle ping command: {}", .{err});
             };
         } else {
@@ -76,24 +76,16 @@ fn handleConnect(
 fn handleEcho(
     allocator: std.mem.Allocator,
     rt: *zio.Runtime,
-    node: *peer.Node,
+    node: *peer.RoutingNode,
     tokens: *Tokens,
 ) !void {
     _ = rt;
     const dest_id = try parsePeerId(tokens);
 
-    const p = node.connections.get(dest_id) orelse {
-        log.warn("Not connected to {x}", .{dest_id});
-        return error.PeerNotFound;
-    };
-
-    log.debug("Found peer: {x}.. writing", .{&p.id.publicKey()});
-
     const msg = try allocator.dupe(u8, tokens.rest());
     defer allocator.free(msg);
 
-    _ = try p.encoder.write(.command, .{ .echo = .{ .message = msg } });
-    try p.writer.interface.flush();
+    try node.sendMessage(try .initPublic(dest_id), .command, .{ .echo = .{ .message = msg } });
 
     log.debug("Echo sent: {s}!", .{msg});
 }
@@ -101,21 +93,16 @@ fn handleEcho(
 fn handlePing(
     allocator: std.mem.Allocator,
     rt: *zio.Runtime,
-    node: *peer.Node,
+    node: *peer.RoutingNode,
     tokens: *Tokens,
 ) !void {
-    _ = allocator; // autofix
     _ = rt; // autofix
     const dest_id = try parsePeerId(tokens);
-    const p = node.connections.get(dest_id) orelse {
-        log.warn("Not connected to {x}", .{dest_id});
-        return error.PeerNotFound;
-    };
 
-    log.debug("Found peer: {x}.. writing", .{&p.id.publicKey()});
+    const msg = try allocator.dupe(u8, tokens.rest());
+    defer allocator.free(msg);
 
-    _ = try p.encoder.write(.request, .ping);
-    try p.writer.interface.flush();
+    try node.sendMessage(try .initPublic(dest_id), .request, .ping);
 }
 
 fn parsePeerId(it: *std.mem.TokenIterator(u8, .scalar)) ![32]u8 {
