@@ -79,18 +79,18 @@ pub const Node = struct {
     connections_mutex: std.Thread.Mutex = .{},
 
     transport: TCPTransport,
-    event_handler: *PeerEventHandler,
+    event_handler: CompositePeerEventHandler,
 
     accept_task: ?zio.JoinHandle(void) = null,
     running: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
 
-    pub fn init(allocator: std.mem.Allocator, rt: *zio.Runtime, identity: Identity, event_handler: *PeerEventHandler) !Self {
+    pub fn init(allocator: std.mem.Allocator, rt: *zio.Runtime, identity: Identity) !Self {
         return .{
             .allocator = allocator,
             .rt = rt,
 
             .identity = identity,
-            .event_handler = event_handler,
+            .event_handler = .init(allocator),
 
             .connections = .init(allocator),
             .transport = .{},
@@ -111,6 +111,7 @@ pub const Node = struct {
         self.connections.deinit();
 
         self.transport.close(self.rt);
+        self.event_handler.deinit();
     }
 
     /// Start listening for incoming connections
@@ -152,7 +153,7 @@ pub const Node = struct {
         try self.connections.put(conn.id.publicKey(), conn);
 
         // Trigger event
-        self.event_handler.onPeerConnected(conn);
+        self.event_handler.interface.onPeerConnected(conn);
 
         // Start receive loop for this connection
         conn.receive_task = try self.rt.spawn(receiveLoop, .{ self, conn }, .{});
@@ -165,12 +166,12 @@ pub const Node = struct {
         while (self.running.load(.seq_cst)) {
             const connection = self.transport.accept(self.rt) catch |err| {
                 if (err == error.NotListening) break;
-                self.event_handler.onError(err);
+                self.event_handler.interface.onError(err);
                 continue;
             };
 
             self.handleIncomingConnection(connection) catch |err| {
-                self.event_handler.onError(err);
+                self.event_handler.interface.onError(err);
                 connection.close(self.rt);
             };
         }
@@ -186,7 +187,7 @@ pub const Node = struct {
         try self.connections.put(handshake_result.identity.publicKey(), conn);
 
         // Trigger event
-        self.event_handler.onPeerConnected(conn);
+        self.event_handler.interface.onPeerConnected(conn);
 
         // Start receive loop for this connection
         conn.receive_task = try self.rt.spawn(receiveLoop, .{ self, conn }, .{});
@@ -339,7 +340,7 @@ pub const Node = struct {
 
         if (self.connections.fetchRemove(peer_id)) |entry| {
             entry.value.deinit();
-            self.event_handler.onPeerDisconnected(peer_id);
+            self.event_handler.interface.onPeerDisconnected(peer_id);
         }
     }
 };
@@ -525,6 +526,61 @@ pub const PeerEventHandler = struct {
     pub fn onError(self: *Self, err: anyerror) void {
         if (self.onErrorFn) |callback| {
             callback(self, err);
+        }
+    }
+};
+
+const CompositePeerEventHandler = struct {
+    const Self = @This();
+
+    interface: PeerEventHandler,
+    handlers: std.array_list.Managed(*PeerEventHandler),
+
+    pub fn init(allocator: std.mem.Allocator) Self {
+        return .{
+            .handlers = .init(allocator),
+            .interface = .{
+                .onPeerConnectedFn = onPeerConnected,
+                .onMessageReceivedFn = onMessageReceived,
+                .onPeerDisconnectedFn = onPeerDisconnected,
+                .onErrorFn = onError,
+            },
+        };
+    }
+
+    pub fn register(self: *Self, handler: *PeerEventHandler) !void {
+        try self.handlers.append(handler);
+    }
+
+    pub fn deinit(self: *Self) void {
+        self.handlers.deinit();
+    }
+
+    fn onPeerConnected(h: *PeerEventHandler, conn: *Connection) void {
+        const self: *Self = @alignCast(@fieldParentPtr("interface", h));
+        for (self.handlers.items) |handler| {
+            handler.onPeerConnected(conn);
+        }
+    }
+
+    fn onMessageReceived(h: *PeerEventHandler, peer_id: Identity.PublicKey, op: protocol.Op, payload: protocol.Payload) void {
+        const self: *Self = @alignCast(@fieldParentPtr("interface", h));
+        for (self.handlers.items) |handler| {
+            handler.onMessageReceived(peer_id, op, payload);
+        }
+    }
+
+    fn onPeerDisconnected(h: *PeerEventHandler, peer_id: Identity.PublicKey) void {
+        const self: *Self = @alignCast(@fieldParentPtr("interface", h));
+        for (self.handlers.items) |handler| {
+            handler.onPeerDisconnected(peer_id);
+        }
+    }
+
+    fn onError(h: *PeerEventHandler, err: anyerror) void {
+        const self: *Self = @alignCast(@fieldParentPtr("interface", h));
+        for (self.handlers.items) |handler| {
+            handler.onError(err);
         }
     }
 };

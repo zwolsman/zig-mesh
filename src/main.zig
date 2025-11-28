@@ -45,20 +45,17 @@ pub fn main() !void {
     else
         std.crypto.sign.Ed25519.KeyPair.generate();
 
+    var node = try peer.Node.init(allocator, rt, .{ .full = kp });
+    defer node.deinit();
+
     // Set up event handlers
     var logging_event_handler = LoggingEventHandler.init();
 
     var peer_event_handler = PeerEventHandler.init(allocator);
     defer peer_event_handler.deinit();
 
-    var event_handler = CompositeEventHandler.init(allocator);
-    defer event_handler.deinit();
-
-    try event_handler.handlers.append(&logging_event_handler.interface);
-    try event_handler.handlers.append(&peer_event_handler.interface);
-
-    var node = try peer.Node.init(allocator, rt, .{ .full = kp }, &event_handler.interface);
-    defer node.deinit();
+    try node.event_handler.register(&logging_event_handler.interface);
+    try node.event_handler.register(&peer_event_handler.interface);
 
     std.log.debug("peer id: {x}", .{&node.identity.publicKey()});
 
@@ -201,61 +198,6 @@ const PeerEventHandler = struct {
         std.log.debug("Peers connected: {d}", .{self.peers.items.len});
         for (self.peers.items) |p| {
             std.log.debug("\t{x}", .{p});
-        }
-    }
-};
-
-const CompositeEventHandler = struct {
-    const Self = @This();
-
-    interface: peer.PeerEventHandler,
-    handlers: std.array_list.Managed(*peer.PeerEventHandler),
-
-    pub fn init(allocator: std.mem.Allocator) Self {
-        return .{
-            .handlers = .init(allocator),
-            .interface = .{
-                .onPeerConnectedFn = onPeerConnected,
-                .onMessageReceivedFn = onMessageReceived,
-                .onPeerDisconnectedFn = onPeerDisconnected,
-                .onErrorFn = onError,
-            },
-        };
-    }
-
-    pub fn register(self: *Self, handler: *peer.PeerEventHandler) !void {
-        try self.handlers.append(handler);
-    }
-
-    pub fn deinit(self: *Self) void {
-        self.handlers.deinit();
-    }
-
-    fn onPeerConnected(h: *peer.PeerEventHandler, conn: *peer.Connection) void {
-        const self: *Self = @alignCast(@fieldParentPtr("interface", h));
-        for (self.handlers.items) |handler| {
-            handler.onPeerConnected(conn);
-        }
-    }
-
-    fn onMessageReceived(h: *peer.PeerEventHandler, peer_id: peer.Identity.PublicKey, op: protocol.Op, payload: protocol.Payload) void {
-        const self: *Self = @alignCast(@fieldParentPtr("interface", h));
-        for (self.handlers.items) |handler| {
-            handler.onMessageReceived(peer_id, op, payload);
-        }
-    }
-
-    fn onPeerDisconnected(h: *peer.PeerEventHandler, peer_id: peer.Identity.PublicKey) void {
-        const self: *Self = @alignCast(@fieldParentPtr("interface", h));
-        for (self.handlers.items) |handler| {
-            handler.onPeerDisconnected(peer_id);
-        }
-    }
-
-    fn onError(h: *peer.PeerEventHandler, err: anyerror) void {
-        const self: *Self = @alignCast(@fieldParentPtr("interface", h));
-        for (self.handlers.items) |handler| {
-            handler.onError(err);
         }
     }
 };
