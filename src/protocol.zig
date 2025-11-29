@@ -34,9 +34,20 @@ const PayloadTag = enum(u8) {
 };
 
 pub const Payload = union(PayloadTag) {
+    pub const Route = struct {
+        destination: [32]u8,
+        hops_len: u8,
+        hops_buff: [16][32]u8,
+        payload: []const u8,
+
+        pub fn hops(self: *const Route) []const [32]u8 {
+            return self.hops_buff[0..self.hops_len];
+        }
+    };
+
     ping: void,
     echo: struct { message: []u8 },
-    route: struct { destination: [32]u8, payload: []const u8 },
+    route: Route,
 };
 
 const Header = struct {
@@ -186,11 +197,19 @@ pub const Decoder = struct {
                 break :read_payload Payload{ .echo = .{ .message = try self.reader.take(msg_len) } };
             },
             .route => {
-                const dest = try self.reader.takeArray(32);
+                var route: Payload.Route = undefined;
+
+                route.destination = (try self.reader.takeArray(32)).*;
+                route.hops_len = try self.reader.takeInt(u8, .big);
+
+                for (0..route.hops_len) |i| {
+                    route.hops_buff[i] = (try self.reader.takeArray(32)).*;
+                }
+
                 const payload_len = try self.reader.takeInt(u16, .big);
-                const payload = try self.reader.take(payload_len);
-                // const mask = try self.reader.takeInt(Filter.BitSet.MaskInt, .big);
-                break :read_payload Payload{ .route = .{ .destination = dest.*, .payload = payload } };
+                route.payload = try self.reader.take(payload_len);
+
+                break :read_payload Payload{ .route = route };
             },
         };
 
@@ -319,6 +338,10 @@ pub const Encoder = struct {
             },
             .route => |route| {
                 try self.writer.writeAll(&route.destination);
+                try self.writer.writeInt(u8, @intCast(route.hops_len), .big);
+                for (0..route.hops_len) |i| {
+                    try self.writer.writeAll(&route.hops_buff[i]);
+                }
                 try self.writer.writeInt(u16, @intCast(route.payload.len), .big);
                 try self.writer.writeAll(route.payload);
             },

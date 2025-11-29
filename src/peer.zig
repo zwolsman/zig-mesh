@@ -569,6 +569,8 @@ const RelayedConnection = struct {
             .route = .{
                 .destination = destination.publicKey(),
                 .payload = payload,
+                .hops_len = 0,
+                .hops_buff = undefined,
             },
         });
     }
@@ -666,7 +668,6 @@ pub const RoutingNode = struct {
     }
 
     fn onMessageReceived(h: *PeerEventHandler, peer_id: Identity.PublicKey, op: protocol.Op, tag: protocol.Payload) void {
-        log.debug("Received message", .{});
         if (op != .command) return;
         if (tag != .route) return;
         const self: *Self = @alignCast(@fieldParentPtr("event_handler", h));
@@ -676,29 +677,52 @@ pub const RoutingNode = struct {
         };
     }
 
-    fn handleRoute(self: *Self, peer_id: Identity.PublicKey, route: std.meta.TagPayload(protocol.Payload, .route)) !void {
-        log.debug("Received route command from {x}: {any}", .{ &peer_id, route });
+    fn handleRoute(self: *Self, peer_id: Identity.PublicKey, route: protocol.Payload.Route) !void {
+        log.debug("Received route command from {x}", .{&peer_id});
+        log.debug("payload len={d}, data={any}", .{ route.payload.len, route.payload });
+        log.debug("hops ({d}): ", .{route.hops_len});
+        for (route.hops()) |h| {
+            log.debug("\t - {x}", .{&h});
+        }
 
         if (std.mem.eql(u8, &route.destination, &self.base.identity.publicKey())) {
             log.debug("End station received", .{});
             return;
         }
 
+        var updated_route = route;
+        updated_route.hops_buff[route.hops_len + 1] = self.base.identity.publicKey();
+        updated_route.hops_len += 1;
+
+        const result = self.base.sendMessage(try .initPublic(route.destination), .command, .{ .route = updated_route });
+
+        if (result != error.UnknownPeer) {
+            return result;
+        }
+
         var peers: [16]*Connection = undefined;
         const len = self.routing_table.closestTo(&peers, route.destination);
         if (len == 0) return error.Unroutable;
+        log.debug("Found {d} peers to route to", .{len});
+        for (0..len) |i| {
+            log.debug("\t- {x}", .{&peers[i].id.publicKey()});
+        }
 
-        for (peers[0..len]) |conn| {
-            conn.sendMessage(.command, .{
-                .route = .{
-                    .destination = route.destination,
-                    .payload = route.payload,
-                },
-            }) catch |err| {
+        hop: for (peers[0..len]) |conn| {
+            if (std.mem.eql(u8, &conn.id.publicKey(), &peer_id))
+                continue :hop;
+
+            for (route.hops()) |hop| {
+                // potential hop is already used
+                if (std.mem.eql(u8, &hop, &conn.id.publicKey()))
+                    continue :hop;
+            }
+
+            conn.sendMessage(.command, .{ .route = updated_route }) catch |err| {
                 log.debug("Could not forward route to {x}: {}", .{ &conn.id.publicKey(), err });
                 continue;
             };
-
+            log.debug("Forward route to {x}", .{&conn.id.publicKey()});
             return;
         }
     }
