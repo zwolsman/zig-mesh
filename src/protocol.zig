@@ -20,6 +20,13 @@ pub const Op = union(OpTag) {
     command: void,
 };
 
+/// Op when writing data
+pub const WriteOp = union(OpTag) {
+    request,
+    response: [16]u8,
+    command,
+};
+
 const PayloadTag = enum(u8) {
     ping = 0x0,
     echo = 0x1,
@@ -197,12 +204,6 @@ pub const Decoder = struct {
 pub const Encoder = struct {
     const Self = @This();
     const log = std.log.scoped(.encoder);
-
-    pub const WriteOp = union(OpTag) {
-        request,
-        response: [16]u8,
-        command,
-    };
 
     out: *std.Io.Writer,
     cipher: noise.CipherState,

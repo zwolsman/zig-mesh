@@ -1,5 +1,6 @@
 const std = @import("std");
 const Ed25519 = std.crypto.sign.Ed25519;
+const X25519 = std.crypto.dh.X25519;
 
 const zio = @import("zio");
 
@@ -163,11 +164,10 @@ pub const Node = struct {
     }
 
     /// Send message to remote peer
-    pub fn sendMessage(self: *Self, destination: Identity, op: protocol.Encoder.WriteOp, tag: protocol.Payload) !void {
+    pub fn sendMessage(self: *Self, destination: Identity, op: protocol.WriteOp, tag: protocol.Payload) !void {
         const conn = self.connections.get(destination.publicKey()) orelse return error.UnknownPeer;
 
-        _ = try conn.encoder.write(op, tag);
-        try conn.writer.interface.flush();
+        _ = try conn.sendMessage(op, tag);
     }
 
     /// Accept loop (runs in background task)
@@ -302,41 +302,24 @@ pub const Node = struct {
 
     fn receiveLoop(self: *Self, conn: *Connection) void {
         while (conn.state == .connected) {
-            const op, const payload = conn.receiveMessage() catch {
-
-                //TODO: self.event_handler.onError(err);
+            const op, const payload = conn.receiveMessage() catch |err| {
+                self.event_handler.interface.onError(err);
                 break;
             };
 
             log.debug("op: {any}, payload: {any}", .{ op, payload });
 
             // Handle special message types
-            switch (op) {
-                .request => {
-                    switch (payload) {
-                        .ping => {},
-                        else => {},
-                    }
-                },
-                .response => {},
-                .command => {
-                    switch (payload) {
-                        .route => {},
-                        .echo => |echo| {
-                            std.debug.print("{x}: {s}\n", .{ &conn.id.publicKey(), echo.message });
-                        },
-                        else => {},
-                    }
-                },
+            if (op == .command and payload == .echo) {
+                std.debug.print("{x}: {s}\n", .{ &conn.id.publicKey(), payload.echo.message });
+            } else {
+                self.event_handler.interface.onMessageReceived(
+                    conn.id.publicKey(),
+                    op,
+                    payload,
+                );
             }
         }
-
-        // TODO : Trigger message received event
-        // self.event_handler.onMessageReceived(
-        //     conn.getRemotePeerId(),
-        //     message,
-        // );
-        // },
 
         // Connection closed, clean up
         self.disconnect(conn.id.publicKey());
@@ -348,8 +331,8 @@ pub const Node = struct {
         defer self.connections_mutex.unlock();
 
         if (self.connections.fetchRemove(peer_id)) |entry| {
-            entry.value.deinit();
             self.event_handler.interface.onPeerDisconnected(peer_id);
+            entry.value.deinit();
         }
     }
 };
@@ -487,7 +470,8 @@ pub const Connection = struct {
             return error.NotConnected;
         }
 
-        try self.encoder.write(op, tag);
+        _ = try self.encoder.write(op, tag);
+        try self.writer.interface.flush();
     }
 
     /// Receive the next message from this peer
@@ -506,25 +490,117 @@ pub const Connection = struct {
     }
 };
 
+const RelayedConnection = struct {
+    const NOISE_PROTOCOL_NAME = "Noise_IK_25519_ChaChaPoly_SHA256";
+    const log = std.log.scoped(.relayed_conn);
+
+    const Self = @This();
+
+    allocator: std.mem.Allocator,
+    buffer: []u8,
+    writer: std.Io.Writer,
+    handshake_state: noise.HandshakeState,
+    encoder: ?protocol.Encoder = null,
+
+    write_mutex: std.Thread.Mutex = .{},
+
+    pub fn init(allocator: std.mem.Allocator, destination: Identity, role: noise.Role) !*Self {
+        const conn = try allocator.create(RelayedConnection);
+        errdefer allocator.destroy(conn);
+
+        conn.* = .{
+            .allocator = allocator,
+            .buffer = try allocator.alloc(u8, 1028),
+            .writer = .fixed(conn.buffer),
+            .handshake_state = try .init(allocator, NOISE_PROTOCOL_NAME, role, null, null, .{
+                .rs = try X25519.publicKeyFromEd25519(try .fromBytes(destination.publicKey())),
+            }),
+        };
+
+        return conn;
+    }
+
+    pub fn deinit(self: *Self) void {
+        self.handshake_state.deinit();
+
+        self.allocator.free(self.buffer);
+        self.allocator.destroy(self);
+    }
+
+    pub fn sendMessage(self: *Self, destination: Identity, conn: *Connection, op: protocol.WriteOp, tag: protocol.Payload) !void {
+        const payload = if (self.encoder) |*encoder| payload: {
+            log.debug("already has encoder", .{});
+            self.write_mutex.lock();
+            defer self.write_mutex.unlock();
+
+            _ = try encoder.write(op, tag); // TODO: return id
+
+            break :payload encoder.out.buffered();
+        } else p: {
+            log.debug("using handshake state -- {s} ({s})", .{ NOISE_PROTOCOL_NAME, @tagName(self.handshake_state.role) });
+
+            // Create payload
+            var payload_buffer: [512]u8 = undefined;
+            var payload_writer = std.Io.Writer.fixed(&payload_buffer);
+            var encoder = protocol.Encoder.init(&payload_writer, .empty, self.buffer);
+            _ = try encoder.write(op, tag);
+
+            // Write handshake message
+            const ciphers = try self.handshake_state.write(&self.writer, payload_writer.buffered());
+
+            if (ciphers) |c| {
+                log.debug("finished handshake", .{});
+                switch (self.handshake_state.role) {
+                    .initiator => {
+                        self.encoder = .init(&self.writer, c.@"0", self.buffer);
+                    },
+                    .responder => {
+                        self.encoder = .init(&self.writer, c.@"1", self.buffer);
+                    },
+                }
+            }
+            break :p self.writer.buffered();
+        };
+
+        log.debug("route payload: {any}", .{payload});
+
+        // Create route command
+        try conn.sendMessage(.command, .{
+            .route = .{
+                .destination = destination.publicKey(),
+                .payload = payload,
+            },
+        });
+    }
+};
+
 pub const RoutingNode = struct {
     const Self = @This();
     const log = std.log.scoped(.router);
 
     base: *Node,
+    allocator: std.mem.Allocator,
     routing_table: kademlia.RoutingTable,
     routing_mutex: std.Thread.Mutex = .{},
+
+    // Track relayed connections (E2E encrypted)
+    relayed_connections: std.AutoHashMap(Identity.PublicKey, *RelayedConnection),
+    relayed_mutex: std.Thread.Mutex = .{},
 
     event_handler: PeerEventHandler = .{
         .onPeerConnectedFn = onPeerConnected,
         .onPeerDisconnectedFn = onPeerDisconnected,
+        .onMessageReceivedFn = onMessageReceived,
     },
 
-    pub fn init(node: *Node) Self {
+    pub fn init(allocator: std.mem.Allocator, node: *Node) Self {
         return .{
+            .allocator = allocator,
             .base = node,
             .routing_table = .{
                 .public_key = node.identity.publicKey(),
             },
+            .relayed_connections = .init(allocator),
         };
     }
 
@@ -533,7 +609,7 @@ pub const RoutingNode = struct {
         try self.base.event_handler.register(&self.event_handler);
     }
 
-    pub fn sendMessage(self: *Self, destination: Identity, op: protocol.Encoder.WriteOp, tag: protocol.Payload) !void {
+    pub fn sendMessage(self: *Self, destination: Identity, op: protocol.WriteOp, tag: protocol.Payload) !void {
         self.base.sendMessage(destination, op, tag) catch |err| {
             return switch (err) {
                 error.UnknownPeer => self.forwardMessage(destination, op, tag),
@@ -542,9 +618,31 @@ pub const RoutingNode = struct {
         };
     }
 
-    fn forwardMessage(self: *Self, destination: Identity, op: protocol.Encoder.WriteOp, tag: protocol.Payload) !void {
-        _ = self;
-        log.debug("TODO: implement forwarding (dest={x}, op={any}, tag={any})", .{ &destination.publicKey(), op, tag });
+    fn forwardMessage(self: *Self, destination: Identity, op: protocol.WriteOp, tag: protocol.Payload) !void {
+        self.relayed_mutex.lock();
+        defer self.relayed_mutex.unlock();
+
+        const result = try self.relayed_connections.getOrPut(destination.publicKey());
+        if (!result.found_existing) {
+            result.value_ptr.* = try RelayedConnection.init(self.allocator, destination, .initiator);
+        }
+
+        const relayed_conn = result.value_ptr.*;
+
+        var peers: [16]*Connection = undefined;
+        const len = self.routing_table.closestTo(&peers, destination.publicKey());
+        if (len == 0) return error.Unroutable;
+
+        for (peers[0..len]) |conn| {
+            relayed_conn.sendMessage(destination, conn, op, tag) catch |err| {
+                log.debug("Could not forward route to: {x}: {}", .{ &conn.id.publicKey(), err });
+                continue;
+            };
+
+            return;
+        }
+
+        return error.Unroutable;
     }
 
     fn onPeerConnected(h: *PeerEventHandler, conn: *Connection) void {
@@ -554,7 +652,7 @@ pub const RoutingNode = struct {
 
         const result = self.routing_table.put(conn);
 
-        log.debug("routing table route {x} ({any})", .{ &conn.id.publicKey(), result });
+        log.debug("routing table route {x} ({s})", .{ &conn.id.publicKey(), @tagName(result) });
     }
 
     fn onPeerDisconnected(h: *PeerEventHandler, peer_id: Identity.PublicKey) void {
@@ -565,6 +663,54 @@ pub const RoutingNode = struct {
         if (self.routing_table.delete(peer_id)) {
             log.debug("routing table route {x} (removed)", .{&peer_id});
         }
+    }
+
+    fn onMessageReceived(h: *PeerEventHandler, peer_id: Identity.PublicKey, op: protocol.Op, tag: protocol.Payload) void {
+        log.debug("Received message", .{});
+        if (op != .command) return;
+        if (tag != .route) return;
+        const self: *Self = @alignCast(@fieldParentPtr("event_handler", h));
+
+        self.handleRoute(peer_id, tag.route) catch |err| {
+            log.debug("Could not handle route from {x}: {}", .{ &peer_id, err });
+        };
+    }
+
+    fn handleRoute(self: *Self, peer_id: Identity.PublicKey, route: std.meta.TagPayload(protocol.Payload, .route)) !void {
+        log.debug("Received route command from {x}: {any}", .{ &peer_id, route });
+
+        if (std.mem.eql(u8, &route.destination, &self.base.identity.publicKey())) {
+            log.debug("End station received", .{});
+            return;
+        }
+
+        var peers: [16]*Connection = undefined;
+        const len = self.routing_table.closestTo(&peers, route.destination);
+        if (len == 0) return error.Unroutable;
+
+        for (peers[0..len]) |conn| {
+            conn.sendMessage(.command, .{
+                .route = .{
+                    .destination = route.destination,
+                    .payload = route.payload,
+                },
+            }) catch |err| {
+                log.debug("Could not forward route to {x}: {}", .{ &conn.id.publicKey(), err });
+                continue;
+            };
+
+            return;
+        }
+    }
+
+    pub fn deinit(self: *Self) void {
+        self.relayed_mutex.lock();
+        defer self.relayed_mutex.unlock();
+        var it = self.relayed_connections.valueIterator();
+        while (it.next()) |conn| {
+            conn.*.deinit();
+        }
+        self.relayed_connections.deinit();
     }
 };
 

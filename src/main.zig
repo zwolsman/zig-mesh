@@ -57,7 +57,9 @@ pub fn main() !void {
     var node_job = try rt.spawn(peer.Node.start, .{ &node, address }, .{});
     node_job.detach(rt);
 
-    var router = peer.RoutingNode.init(&node);
+    var router = peer.RoutingNode.init(allocator, &node);
+    defer router.deinit();
+
     try router.start();
 
     if (options.peer_discovery) {

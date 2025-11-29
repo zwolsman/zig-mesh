@@ -9,7 +9,7 @@ pub const RoutingTable = struct {
     const bucket_size = 16;
     const bucket_count = 256;
 
-    const Bucket = StaticRingBuffer(peer.Identity.PublicKey, u64, bucket_size);
+    const Bucket = StaticRingBuffer(*peer.Connection, u64, bucket_size);
 
     public_key: peer.Identity.PublicKey,
     buckets: [bucket_count]Bucket = [_]Bucket{.{}} ** bucket_count,
@@ -41,7 +41,7 @@ pub const RoutingTable = struct {
         var j: usize = bucket.head;
         while (i != bucket.tail) : (i -%= 1) {
             const it = bucket.entries[(i -% 1) & (bucket_size - 1)];
-            if (!std.mem.eql(u8, &it, &public_key)) {
+            if (!std.mem.eql(u8, &it.id.publicKey(), &public_key)) {
                 bucket.entries[(j -% 1) & (bucket_size - 1)] = it;
                 j -%= 1;
             }
@@ -74,7 +74,7 @@ pub const RoutingTable = struct {
             return .full;
         }
 
-        bucket.push(conn.id.publicKey());
+        bucket.push(conn);
 
         if (removed) {
             return .updated;
@@ -152,7 +152,7 @@ pub const RoutingTable = struct {
             const mid = left + size / 2;
             switch (std.mem.order(
                 u8,
-                &xor(slice[mid].public_key, our_public_key),
+                &xor(slice[mid].id.publicKey(), our_public_key),
                 &xor(public_key, our_public_key),
             )) {
                 .lt => left = mid + 1,
@@ -170,8 +170,8 @@ pub const RoutingTable = struct {
         var i: usize = bucket.head;
         while (i != bucket.tail) : (i -%= 1) {
             const it = bucket.entries[(i -% 1) & (bucket_size - 1)];
-            if (!std.mem.eql(u8, &it, &public_key)) {
-                const result = binarySearch(self.public_key, dst[0..count.*], it.public_key);
+            if (!std.mem.eql(u8, &it.id.publicKey(), &public_key)) {
+                const result = binarySearch(self.public_key, dst[0..count.*], it.id.publicKey());
                 std.debug.assert(result != .found);
 
                 const index = result.not_found;
