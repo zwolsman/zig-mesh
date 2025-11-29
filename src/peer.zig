@@ -491,29 +491,40 @@ pub const Connection = struct {
 };
 
 const RelayedConnection = struct {
-    const NOISE_PROTOCOL_NAME = "Noise_IK_25519_ChaChaPoly_SHA256";
+    const protocol_name = "Noise_IK_25519_ChaChaPoly_SHA256";
     const log = std.log.scoped(.relayed_conn);
 
     const Self = @This();
 
     allocator: std.mem.Allocator,
-    buffer: []u8,
-    writer: std.Io.Writer,
+    hop_identity: Identity,
+    encoder_buffer: []u8,
+    decoder_buffer: []u8,
+
     handshake_state: noise.HandshakeState,
-    encoder: ?protocol.Encoder = null,
+
+    send_cipher: ?noise.CipherState = null,
+    recv_cipher: ?noise.CipherState = null,
 
     write_mutex: std.Thread.Mutex = .{},
+    read_mutex: std.Thread.Mutex = .{},
 
-    pub fn init(allocator: std.mem.Allocator, destination: Identity, role: noise.Role) !*Self {
+    pub fn init(allocator: std.mem.Allocator, hop_identity: Identity, destination: Identity) !*Self {
         const conn = try allocator.create(RelayedConnection);
         errdefer allocator.destroy(conn);
+        const role: noise.Role = switch (destination) {
+            .full => .responder,
+            .public => .initiator,
+        };
 
         conn.* = .{
             .allocator = allocator,
-            .buffer = try allocator.alloc(u8, 1028),
-            .writer = .fixed(conn.buffer),
-            .handshake_state = try .init(allocator, NOISE_PROTOCOL_NAME, role, null, null, .{
-                .rs = try X25519.publicKeyFromEd25519(try .fromBytes(destination.publicKey())),
+            .hop_identity = hop_identity,
+            .encoder_buffer = try allocator.alloc(u8, 1028),
+            .decoder_buffer = try allocator.alloc(u8, 1028),
+            .handshake_state = try .init(allocator, protocol_name, role, null, null, .{
+                .rs = if (destination == .public) try X25519.publicKeyFromEd25519(destination.public) else null,
+                .s = if (destination == .full) try X25519.KeyPair.fromEd25519(destination.full) else null,
             }),
         };
 
@@ -523,56 +534,93 @@ const RelayedConnection = struct {
     pub fn deinit(self: *Self) void {
         self.handshake_state.deinit();
 
-        self.allocator.free(self.buffer);
+        self.allocator.free(self.encoder_buffer);
+        self.allocator.free(self.decoder_buffer);
         self.allocator.destroy(self);
     }
 
     pub fn sendMessage(self: *Self, destination: Identity, conn: *Connection, op: protocol.WriteOp, tag: protocol.Payload) !void {
-        const payload = if (self.encoder) |*encoder| payload: {
+        self.write_mutex.lock();
+        defer self.write_mutex.unlock();
+        var writer = std.Io.Writer.fixed(self.encoder_buffer);
+
+        const payload = if (self.send_cipher) |*c| payload: {
             log.debug("already has encoder", .{});
-            self.write_mutex.lock();
-            defer self.write_mutex.unlock();
 
-            _ = try encoder.write(op, tag); // TODO: return id
+            _ = try protocol.writeMessage(&writer, op, tag);
 
-            break :payload encoder.out.buffered();
-        } else p: {
-            log.debug("using handshake state -- {s} ({s})", .{ NOISE_PROTOCOL_NAME, @tagName(self.handshake_state.role) });
+            break :payload try c.encryptWithAd(self.encoder_buffer, "", writer.buffered());
+        } else payload: {
+            log.debug("using handshake state -- {s} ({s})", .{ protocol_name, @tagName(self.handshake_state.role) });
 
             // Create payload
-            var payload_buffer: [512]u8 = undefined;
-            var payload_writer = std.Io.Writer.fixed(&payload_buffer);
-            var encoder = protocol.Encoder.init(&payload_writer, .empty, self.buffer);
-            _ = try encoder.write(op, tag);
+            _ = try protocol.writeMessage(&writer, op, tag);
+
+            const end = writer.end;
 
             // Write handshake message
-            const ciphers = try self.handshake_state.write(&self.writer, payload_writer.buffered());
+            const ciphers = try self.handshake_state.write(&writer, writer.buffered());
 
             if (ciphers) |c| {
-                log.debug("finished handshake", .{});
+                log.debug("Finalised IK handshake ({s})", .{@tagName(self.handshake_state.role)});
                 switch (self.handshake_state.role) {
                     .initiator => {
-                        self.encoder = .init(&self.writer, c.@"0", self.buffer);
+                        self.send_cipher = c.@"0";
+                        self.recv_cipher = c.@"1";
                     },
                     .responder => {
-                        self.encoder = .init(&self.writer, c.@"1", self.buffer);
+                        self.send_cipher = c.@"1";
+                        self.recv_cipher = c.@"0";
                     },
                 }
             }
-            break :p self.writer.buffered();
+
+            break :payload writer.buffer[end..writer.end];
         };
 
         log.debug("route payload: {any}", .{payload});
 
+        var route: protocol.Payload.Route = undefined;
+        route.destination = destination.publicKey();
+        route.hops_buff[0] = self.hop_identity.publicKey();
+        route.hops_len = 1;
+        route.payload = payload;
+
         // Create route command
-        try conn.sendMessage(.command, .{
-            .route = .{
-                .destination = destination.publicKey(),
-                .payload = payload,
-                .hops_len = 0,
-                .hops_buff = undefined,
-            },
-        });
+        try conn.sendMessage(.command, .{ .route = route });
+    }
+
+    pub fn readMessage(self: *Self, in: *std.Io.Reader) !struct { protocol.Op, protocol.Payload } {
+        self.read_mutex.lock();
+        defer self.read_mutex.unlock();
+
+        const payload = if (self.recv_cipher) |*c| p: {
+            log.debug("already has decoder", .{});
+
+            break :p try c.decryptWithAd(self.decoder_buffer, "", in.buffered());
+        } else p: {
+            const payload, const ciphers = try self.handshake_state.read(in);
+
+            if (ciphers) |c| {
+                log.debug("Finalised IK handshake ({s})", .{@tagName(self.handshake_state.role)});
+
+                switch (self.handshake_state.role) {
+                    .initiator => {
+                        self.send_cipher = c.@"0";
+                        self.recv_cipher = c.@"1";
+                    },
+                    .responder => {
+                        self.send_cipher = c.@"1";
+                        self.recv_cipher = c.@"0";
+                    },
+                }
+            }
+
+            break :p payload;
+        };
+
+        var reader = std.Io.Reader.fixed(payload);
+        return protocol.readMessage(&reader);
     }
 };
 
@@ -626,7 +674,7 @@ pub const RoutingNode = struct {
 
         const result = try self.relayed_connections.getOrPut(destination.publicKey());
         if (!result.found_existing) {
-            result.value_ptr.* = try RelayedConnection.init(self.allocator, destination, .initiator);
+            result.value_ptr.* = try RelayedConnection.init(self.allocator, self.base.identity, destination);
         }
 
         const relayed_conn = result.value_ptr.*;
@@ -687,11 +735,11 @@ pub const RoutingNode = struct {
 
         if (std.mem.eql(u8, &route.destination, &self.base.identity.publicKey())) {
             log.debug("End station received", .{});
-            return;
+            return self.processRoutedMessage(route);
         }
 
         var updated_route = route;
-        updated_route.hops_buff[route.hops_len + 1] = self.base.identity.publicKey();
+        updated_route.hops_buff[route.hops_len] = self.base.identity.publicKey();
         updated_route.hops_len += 1;
 
         const result = self.base.sendMessage(try .initPublic(route.destination), .command, .{ .route = updated_route });
@@ -725,6 +773,24 @@ pub const RoutingNode = struct {
             log.debug("Forward route to {x}", .{&conn.id.publicKey()});
             return;
         }
+    }
+
+    fn processRoutedMessage(self: *Self, route: protocol.Payload.Route) !void {
+        self.relayed_mutex.lock();
+        defer self.relayed_mutex.unlock();
+
+        const result = try self.relayed_connections.getOrPut(route.hops_buff[0]); // TODO: fix this
+        if (!result.found_existing) {
+            result.value_ptr.* = try RelayedConnection.init(self.allocator, self.base.identity, self.base.identity);
+        }
+
+        const relayed_conn = result.value_ptr.*;
+        var in = std.Io.Reader.fixed(route.payload);
+
+        const op, const payload = try relayed_conn.readMessage(&in);
+
+        log.debug("routed message: {s}, {any}", .{ @tagName(op), payload });
+        self.base.event_handler.interface.onMessageReceived(route.hops_buff[0], op, payload);
     }
 
     pub fn deinit(self: *Self) void {

@@ -175,48 +175,7 @@ pub const Decoder = struct {
 
     /// read op and payload from in
     pub fn read(self: *Self) !struct { Op, Payload } {
-        const op_type: OpTag = @enumFromInt(try self.reader.takeInt(u8, .big));
-        const op = op: switch (op_type) {
-            .command => Op.command,
-            .request => {
-                const key = try self.reader.takeArray(16);
-                break :op Op{ .request = key.* };
-            },
-            .response => {
-                const key = try self.reader.takeArray(16);
-                break :op Op{ .response = key.* };
-            },
-        };
-
-        const tag: PayloadTag = @enumFromInt(try self.reader.takeInt(u8, .big));
-
-        const payload = read_payload: switch (tag) {
-            .ping => Payload.ping,
-            .echo => {
-                const msg_len = try self.reader.takeInt(u16, .big);
-                break :read_payload Payload{ .echo = .{ .message = try self.reader.take(msg_len) } };
-            },
-            .route => {
-                var route: Payload.Route = undefined;
-
-                route.destination = (try self.reader.takeArray(32)).*;
-                route.hops_len = try self.reader.takeInt(u8, .big);
-
-                for (0..route.hops_len) |i| {
-                    route.hops_buff[i] = (try self.reader.takeArray(32)).*;
-                }
-
-                const payload_len = try self.reader.takeInt(u16, .big);
-                route.payload = try self.reader.take(payload_len);
-
-                break :read_payload Payload{ .route = route };
-            },
-        };
-
-        return .{
-            op,
-            payload,
-        };
+        return readMessage(&self.reader);
     }
 };
 
@@ -312,46 +271,96 @@ pub const Encoder = struct {
 
     /// write an op and payload to internal buffer
     pub fn write(self: *Self, op: WriteOp, tag: Payload) !?[16]u8 {
-        try self.writer.writeInt(u8, @intFromEnum(op), .big);
-
-        const maybe_id: ?[16]u8 = id: switch (op) {
-            .response => |id| break :id id,
-            .request => {
-                var request_id: [16]u8 = undefined;
-                std.crypto.random.bytes(&request_id);
-                break :id request_id;
-            },
-            .command => break :id null,
-        };
-
-        if (maybe_id) |id| {
-            try self.writer.writeAll(&id);
-        }
-
-        try self.writer.writeInt(u8, @intFromEnum(tag), .big);
-
-        switch (tag) {
-            .ping => {},
-            .echo => |echo| {
-                try self.writer.writeInt(u16, @intCast(echo.message.len), .big);
-                try self.writer.writeAll(echo.message);
-            },
-            .route => |route| {
-                try self.writer.writeAll(&route.destination);
-                try self.writer.writeInt(u8, @intCast(route.hops_len), .big);
-                for (0..route.hops_len) |i| {
-                    try self.writer.writeAll(&route.hops_buff[i]);
-                }
-                try self.writer.writeInt(u16, @intCast(route.payload.len), .big);
-                try self.writer.writeAll(route.payload);
-            },
-        }
-
+        const maybe_id = try writeMessage(&self.writer, op, tag);
         try self.writer.flush();
 
         return maybe_id;
     }
 };
+
+pub fn writeMessage(out: *std.Io.Writer, op: WriteOp, tag: Payload) !?[16]u8 {
+    try out.writeInt(u8, @intFromEnum(op), .big);
+
+    const maybe_id: ?[16]u8 = id: switch (op) {
+        .response => |id| break :id id,
+        .request => {
+            var request_id: [16]u8 = undefined;
+            std.crypto.random.bytes(&request_id);
+            break :id request_id;
+        },
+        .command => break :id null,
+    };
+
+    if (maybe_id) |id| {
+        try out.writeAll(&id);
+    }
+
+    try out.writeInt(u8, @intFromEnum(tag), .big);
+
+    switch (tag) {
+        .ping => {},
+        .echo => |echo| {
+            try out.writeInt(u16, @intCast(echo.message.len), .big);
+            try out.writeAll(echo.message);
+        },
+        .route => |route| {
+            try out.writeAll(&route.destination);
+            try out.writeInt(u8, @intCast(route.hops_len), .big);
+            for (0..route.hops_len) |i| {
+                try out.writeAll(&route.hops_buff[i]);
+            }
+            try out.writeInt(u16, @intCast(route.payload.len), .big);
+            try out.writeAll(route.payload);
+        },
+    }
+
+    return maybe_id;
+}
+
+pub fn readMessage(in: *std.Io.Reader) !struct { Op, Payload } {
+    const op_type: OpTag = @enumFromInt(try in.takeInt(u8, .big));
+    const op = op: switch (op_type) {
+        .command => Op.command,
+        .request => {
+            const key = try in.takeArray(16);
+            break :op Op{ .request = key.* };
+        },
+        .response => {
+            const key = try in.takeArray(16);
+            break :op Op{ .response = key.* };
+        },
+    };
+
+    const tag: PayloadTag = @enumFromInt(try in.takeInt(u8, .big));
+
+    const payload = read_payload: switch (tag) {
+        .ping => Payload.ping,
+        .echo => {
+            const msg_len = try in.takeInt(u16, .big);
+            break :read_payload Payload{ .echo = .{ .message = try in.take(msg_len) } };
+        },
+        .route => {
+            var route: Payload.Route = undefined;
+
+            route.destination = (try in.takeArray(32)).*;
+            route.hops_len = try in.takeInt(u8, .big);
+
+            for (0..route.hops_len) |i| {
+                route.hops_buff[i] = (try in.takeArray(32)).*;
+            }
+
+            const payload_len = try in.takeInt(u16, .big);
+            route.payload = try in.take(payload_len);
+
+            break :read_payload Payload{ .route = route };
+        },
+    };
+
+    return .{
+        op,
+        payload,
+    };
+}
 
 test "Should be able to read message with empty key" {
     const data = [_]u8{ 0x1, 0x1, 0x0, 0x1, 0x0 }; // version, application data, len = 1, data = 0x0
