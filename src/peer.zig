@@ -159,6 +159,7 @@ pub const Node = struct {
 
         // Start receive loop for this connection
         conn.receive_task = try self.rt.spawn(receiveLoop, .{ self, conn }, .{});
+        conn.receive_task.?.detach(self.rt);
 
         return conn;
     }
