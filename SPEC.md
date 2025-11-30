@@ -39,6 +39,7 @@ There are two types of packets currently defined:
 
 1. **Ping**
 2. **Echo**
+3. **Route**
 
 ### Common Packet Fields
 
@@ -67,6 +68,77 @@ Each packet contains the following fields:
 | ----- | ------ | -------------------------- |
 | len   | `u16`  | length of the payload body |
 | bytes | `[]u8` | message                    |
+
+### Route Packet
+
+To route a packet to a destination through the mesh network the initiator starts an IK handshake with the destination node. Based on the ED25519 public key, a remote static (`rs`) X25519 public key can be derived. After a succesfull handshake the ciphers will be split. From the receiving point, the node identity key can be used to create a static key (`s`) and handle the handshake as responder.
+
+When receiving a route packet decrypt the payload based on the Noise IK handshake. Once decrypted read it as a packet. Do note: **no** packet header will be present.
+
+Handshake pattern:
+
+```
+ IK:
+  <- s
+  ...
+  -> e, es, s, ss
+  <- e, ee, se
+```
+
+This ensures e2e encryption between each hop and another layer of e2e encryption for the destination node.
+
+| Field       | Type     | Description                                               |
+| ----------- | -------- | --------------------------------------------------------- |
+| destination | `[32]u8` | destination public key                                    |
+| n           | `u8`     | number of hops (max 16)                                   |
+| hop         | `[32]u8` | public key of hops. Index 0 = initiator, total tops = `n` |
+| payload     | `[]u8`   | e2e encrypted payload for destination                     |
+
+### What Each Party Can See
+
+```
+Node A (Source)          Node B (Relay)           Node C (Destination)
+═══════════════         ════════════════         ════════════════════
+
+Plaintext: "Secret"
+    ↓
+Encrypt (IK cipher)
+    ↓
+E2E encrypted
+    ↓
+Wrap in Route Payload
+    ↓
+Encode
+    ↓
+Encrypt (XX cipher A-B)
+    ↓
+Send → → → → → → →     Receive
+                            ↓
+                       Decrypt (XX cipher A-B)
+                            ↓
+                       Can see:
+                       - hops: [A]
+                       - destination: C
+                       - n: 1
+                       ✗ CANNOT see inner_payload
+                         (still E2E encrypted!)
+                            ↓
+                       Forward decision
+                            ↓
+                       Encrypt (XX cipher B-C)
+                            ↓
+                       Send → → → → → →     Receive
+                                                 ↓
+                                            Decrypt (XX cipher B-C)
+                                                 ↓
+                                            Can see Route Payload
+                                            dest == self!
+                                                 ↓
+                                            Decrypt inner_payload
+                                            (IK cipher)
+                                                 ↓
+                                            Plaintext: "Secret"
+```
 
 ## Encoding Details
 
